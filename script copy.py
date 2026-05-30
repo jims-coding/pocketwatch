@@ -6,7 +6,6 @@ import geopandas as gpd
 from pyproj import Transformer
 import rasterio
 from rasterio.io import MemoryFile
-from rasterio.transform import Affine
 
 class WAExplorationPipeline:
     def __init__(self, target_epsg=7851):
@@ -129,90 +128,12 @@ class WAExplorationPipeline:
                     nodata = dataset.nodata
                     if nodata is not None:
                         raster_array = np.where(raster_array == nodata, np.nan, raster_array)
-                    transform = (
-                        float(dataset.transform.a),
-                        float(dataset.transform.b),
-                        float(dataset.transform.c),
-                        float(dataset.transform.d),
-                        float(dataset.transform.e),
-                        float(dataset.transform.f),
-                    )
-                    crs = str(dataset.crs) if dataset.crs is not None else None
-                    return {"array": raster_array, "transform": transform, "crs": crs}
+                    return raster_array
 
         except Exception as e:
             print(f"❌ Raster Error: {e}")
             grid_size = int(round(2000 / self.raster_resolution_m))
-            nan_grid = np.full((grid_size, grid_size), np.nan)
-            return {"array": nan_grid, "transform": None, "crs": f"EPSG:{self.target_epsg}"}
-
-    def save_payload(self, payload, out_path="dataset_package.npz"):
-        """Package vector GeoJSONs and raster array/metadata into a single .npz file.
-
-        Vector layers are stored as GeoJSON strings under keys `vector__<layername>`
-        (colons replaced with double-underscores). Raster is stored as `raster`,
-        with `raster_transform` and `raster_crs` metadata.
-        """
-        data = {}
-        layer_names = []
-
-        for lname, gdf in payload.get("vector", {}).items():
-            layer_names.append(lname)
-            key = f"vector__{lname.replace(':', '__')}"
-            try:
-                if gdf is None or gdf.empty:
-                    geojson = "{}"
-                else:
-                    geojson = gdf.to_crs(epsg=4326).to_json()
-            except Exception:
-                geojson = "{}"
-            data[key] = np.array(geojson, dtype=object)
-
-        raster_info = payload.get("raster", {}).get("aster_quartz")
-        if raster_info is not None:
-            data["raster"] = raster_info.get("array")
-            data["raster_transform"] = np.array(raster_info.get("transform"), dtype=float) if raster_info.get("transform") is not None else np.array([], dtype=float)
-            data["raster_crs"] = np.array(raster_info.get("crs"), dtype=object)
-
-        data["vector_layers"] = np.array(layer_names, dtype=object)
-
-        np.savez_compressed(out_path, **data)
-        print(f"-> Saved package to: {out_path}")
-
-    def save_raster_geotiff(self, raster_info, out_path="aster_quartz.tif", compress=True):
-        """Save the extracted raster (numpy array + transform + crs) as a GeoTIFF file."""
-        if raster_info is None:
-            raise ValueError("raster_info is None")
-
-        arr = raster_info.get("array")
-        transform = raster_info.get("transform")
-        crs = raster_info.get("crs") or f"EPSG:{self.target_epsg}"
-
-        if transform is None:
-            print("   ⚠️ No geotransform available; skipping GeoTIFF save.")
-            return None
-
-        affine = Affine(*transform)
-        height, width = arr.shape
-
-        profile = {
-            "driver": "GTiff",
-            "height": int(height),
-            "width": int(width),
-            "count": 1,
-            "dtype": arr.dtype,
-            "crs": crs,
-            "transform": affine,
-            "nodata": np.nan,
-        }
-
-        if compress:
-            profile.update({"tiled": True, "compress": "LZW", "blockxsize": 512, "blockysize": 512})
-
-        with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(arr, 1)
-
-        print(f"-> Saved GeoTIFF: {out_path}")
+            return np.full((grid_size, grid_size), np.nan)
 
     def execute_pipeline(self, lat, lon, vector_layers):
         bbox_str = self.calculate_bbox(lat, lon)
@@ -222,10 +143,10 @@ class WAExplorationPipeline:
             gdf = self.pull_vector_features(bbox_str, v_layer)
             if gdf is not None:
                 feature_payload["vector"][v_layer] = gdf
-        
-        arr_info = self.pull_aster_ga_wcs(bbox_str)
-        if arr_info is not None:
-            feature_payload["raster"]["aster_quartz"] = arr_info
+                
+        arr = self.pull_aster_ga_wcs(bbox_str)
+        if arr is not None:
+             feature_payload["raster"]["aster_quartz"] = arr
                 
         return feature_payload
 
@@ -256,21 +177,11 @@ if __name__ == "__main__":
 
     if not fault_matches:
         print("Secondary Vector Layer: No fault layer exposed by this server.")
-
+        
     if "aster_quartz" in dataset_package["raster"]:
-        raster_info = dataset_package["raster"]["aster_quartz"]
-        aster_data = raster_info.get("array")
+        aster_data = dataset_package["raster"]["aster_quartz"]
         print(f"ASTER Quartz Matrix   : Shape {aster_data.shape}")
         if np.isnan(aster_data).all():
-            print("ASTER Quartz Matrix   : No data in this specific grid cell.")
+             print("ASTER Quartz Matrix   : No data in this specific grid cell.")
         else:
-            print(f"Mean Quartz Alteration: {np.nanmean(aster_data):.4f}")
-
-    # Save a single packaged file for downstream models
-    pipeline.save_payload(dataset_package, out_path="dataset_package.npz")
-    # Also save the raster as a GeoTIFF for GIS/model pipelines
-    try:
-        if "aster_quartz" in dataset_package["raster"]:
-            pipeline.save_raster_geotiff(dataset_package["raster"]["aster_quartz"], out_path="aster_quartz.tif")
-    except Exception as e:
-        print(f"❌ Failed to save GeoTIFF: {e}")
+             print(f"Mean Quartz Alteration: {np.nanmean(aster_data):.4f}")
