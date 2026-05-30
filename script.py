@@ -57,7 +57,7 @@ class WAExplorationPipeline:
              print(f"❌ Discovery Error: {e}")
              return []
 
-    def calculate_bbox(self, lat, lon, buffer_meters=1000):
+    def calculate_bbox(self, lat, lon, buffer_meters=100000):
         x_center, y_center = self.to_meters.transform(lon, lat)
         x_min, x_max = x_center - buffer_meters, x_center + buffer_meters
         y_min, y_max = y_center - buffer_meters, y_center + buffer_meters

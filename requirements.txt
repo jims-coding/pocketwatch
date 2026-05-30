@@ -6,6 +6,7 @@ pyproj>=3.6.0
 pillow==12.2.0
 folium==0.20.0
 matplotlib==3.10.9
+bokeh>=3.4.0
 
 # Optional (helpful for geopandas / spatial indexing)
 fiona>=1.9.0

@@ -1,152 +1,268 @@
-import os
 import io
 import json
+import os
+
+import geopandas as gpd
 import numpy as np
 import rasterio
-from rasterio.transform import Affine
-from rasterio.transform import array_bounds
+import requests
+from bokeh.io import output_file, save
+from bokeh.layouts import column
+from bokeh.models import (
+    BasicTicker,
+    ColorBar,
+    ColumnDataSource,
+    HoverTool,
+    LinearColorMapper,
+    Range1d,
+    Div,
+    WMTSTileSource,
+)
+from bokeh.palettes import Turbo256
+from bokeh.plotting import figure
 from pyproj import Transformer
-from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-
-try:
-    import folium
-    from folium.raster_layers import ImageOverlay
-except Exception:
-    folium = None
+from rasterio.transform import Affine, array_bounds
 
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-DATA_PKG = os.path.join(OUTPUT_DIR, "dataset_package.npz")
-TIFF_FILE = os.path.join(OUTPUT_DIR, "aster_quartz.tif")
-PNG_OVERLAY = os.path.join(OUTPUT_DIR, "aster_quartz_overlay.png")
+PROB_TIF_FILE = os.path.join(OUTPUT_DIR, "probability_grid.tif")
 MAP_FILE = os.path.join(OUTPUT_DIR, "map.html")
+DATA_PKG = os.path.join(OUTPUT_DIR, "dataset_package.npz")
+
+GOV_WFS_URL = "https://geossdi.dmp.wa.gov.au/services/wfs"
 
 
-def create_image_overlay_from_array(arr, transform_tuple, crs, out_png=PNG_OVERLAY):
-    # Compute bounds in raster CRS
-    transform = Affine(*transform_tuple)
+def lonlat_to_web_mercator(lon, lat):
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    return transformer.transform(lon, lat)
+
+
+def bounds_to_web_mercator(west, south, east, north):
+    x0, y0 = lonlat_to_web_mercator(west, south)
+    x1, y1 = lonlat_to_web_mercator(east, north)
+    return x0, y0, x1, y1
+
+
+def load_probability_grid(tif_path):
+    if not os.path.exists(tif_path):
+        raise FileNotFoundError(tif_path)
+
+    with rasterio.open(tif_path) as ds:
+        arr = ds.read(1).astype(float)
+        if ds.nodata is not None:
+            arr = np.where(arr == ds.nodata, np.nan, arr)
+        transform = ds.transform
+        crs = str(ds.crs) if ds.crs is not None else "EPSG:4326"
+
     height, width = arr.shape
     minx, miny, maxx, maxy = array_bounds(height, width, transform)
 
-    # Convert bounds to WGS84 if needed
-    if crs is None or crs.upper().startswith("EPSG:4326"):
-        west, south, east, north = minx, miny, maxx, maxy
+    if crs.upper() != "EPSG:4326":
+        transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+        west, south = transformer.transform(minx, miny)
+        east, north = transformer.transform(maxx, maxy)
     else:
-        try:
-            src_crs = crs
-            transformer = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True)
-            west, south = transformer.transform(minx, miny)
-            east, north = transformer.transform(maxx, maxy)
-        except Exception:
-            # If transformation fails, fallback to reading from TIFF if present
-            west = south = east = north = None
+        west, south, east, north = minx, miny, maxx, maxy
 
-    # Normalize array to 0-1 ignoring NaN
-    arr_float = arr.astype(float)
-    mask = np.isnan(arr_float)
-    if np.all(mask):
-        raise ValueError("Raster contains only NaN")
-
-    vmin = np.nanmin(arr_float)
-    vmax = np.nanmax(arr_float)
-    if vmin == vmax:
-        vmin = 0
-    norm = (arr_float - vmin) / (vmax - vmin)
-    norm = np.clip(norm, 0, 1)
-
-    cmap = cm.get_cmap("viridis")
-    rgba = cmap(norm)
-    rgba[..., 3] = np.where(mask, 0.0, rgba[..., 3])
-    rgba_u8 = (rgba * 255).astype(np.uint8)
-
-    img = Image.fromarray(rgba_u8, mode="RGBA")
-    img.save(out_png)
-    return out_png, (south, west, north, east)
+    x0, y0, x1, y1 = bounds_to_web_mercator(west, south, east, north)
+    mercator_arr = np.flipud(arr)
+    return mercator_arr, x0, y0, x1 - x0, y1 - y0, (west, south, east, north)
 
 
-def build_map(npz_path=DATA_PKG, tiff_path=TIFF_FILE, out_map=MAP_FILE):
-    if folium is None:
-        raise RuntimeError("folium is not installed. Install with: pip install folium")
+def fetch_gold_points(bbox4326):
+    west, south, east, north = bbox4326
+    params = {
+        "service": "WFS",
+        "version": "1.0.0",
+        "request": "GetFeature",
+        "typeName": "mo:MinOccView",
+        "bbox": f"{west},{south},{east},{north}",
+        "outputFormat": "application/json",
+        "srsName": "EPSG:4326",
+    }
+    response = requests.get(GOV_WFS_URL, params=params, timeout=60)
+    response.raise_for_status()
+    payload = response.json()
 
+    xs = []
+    ys = []
+    names = []
+    commodities = []
+    ids = []
+
+    for feature in payload.get("features", []):
+        props = feature.get("properties", {}) or {}
+        commodity = str(props.get("commodity", ""))
+        if not ("Au" in commodity or "gold" in commodity.lower()):
+            continue
+
+        geometry = feature.get("geometry", {}) or {}
+        coords = geometry.get("coordinates")
+        if not coords or len(coords) < 2:
+            continue
+
+        lon, lat = coords[0], coords[1]
+        x, y = lonlat_to_web_mercator(lon, lat)
+        xs.append(x)
+        ys.append(y)
+        names.append(props.get("name", ""))
+        commodities.append(commodity)
+        ids.append(props.get("id", feature.get("id", "")))
+
+    return ColumnDataSource(
+        data={
+            "x": xs,
+            "y": ys,
+            "name": names,
+            "commodity": commodities,
+            "id": ids,
+        }
+    )
+
+
+def load_local_dataset_points(npz_path):
     if not os.path.exists(npz_path):
-        raise FileNotFoundError(f"{npz_path} not found")
+        return ColumnDataSource(data={"x": [], "y": [], "name": [], "commodity": [], "id": []})
 
     data = np.load(npz_path, allow_pickle=True)
-
-    # Load raster either from package or from TIFF file
-    raster = None
-    raster_transform = None
-    raster_crs = None
-
-    if "raster" in data:
-        raster = data["raster"]
-        raster_transform = data.get("raster_transform", np.array([]))
-        raster_crs = data.get("raster_crs", np.array([None]))
-        raster_crs = raster_crs.tolist() if hasattr(raster_crs, "tolist") else raster_crs
-        if isinstance(raster_crs, (list, tuple, np.ndarray)):
-            raster_crs = raster_crs[0] if len(raster_crs) > 0 else None
-    elif os.path.exists(tiff_path):
-        with rasterio.open(tiff_path) as ds:
-            raster = ds.read(1)
-            raster_transform = np.array([ds.transform.a, ds.transform.b, ds.transform.c, ds.transform.d, ds.transform.e, ds.transform.f])
-            raster_crs = str(ds.crs)
-
-    if raster is None:
-        raise RuntimeError("No raster found in package or TIFF file")
-
-    # If transform is empty, try reading from TIFF
-    if raster_transform is None or (isinstance(raster_transform, np.ndarray) and raster_transform.size == 0):
-        if os.path.exists(tiff_path):
-            with rasterio.open(tiff_path) as ds:
-                raster_transform = np.array([ds.transform.a, ds.transform.b, ds.transform.c, ds.transform.d, ds.transform.e, ds.transform.f])
-                raster_crs = str(ds.crs)
-        else:
-            raise RuntimeError("No valid raster transform available")
-
-    # Ensure raster_crs is like 'EPSG:XXXX' or similar
-    if raster_crs is None:
-        raster_crs = f"EPSG:4326"
-
-    # Create PNG overlay and get bounds
-    png_file, bounds = create_image_overlay_from_array(raster, raster_transform.tolist() if isinstance(raster_transform, np.ndarray) else list(raster_transform), raster_crs)
-    south, west, north, east = bounds
-
-    # Center map
-    lat_center = (south + north) / 2.0
-    lon_center = (west + east) / 2.0
-
-    m = folium.Map(location=[lat_center, lon_center], zoom_start=12, tiles="OpenStreetMap")
-
-    # Add image overlay
-    image_overlay = ImageOverlay(name="ASTER Quartz", image=png_file, bounds=[[south, west], [north, east]], opacity=0.7, interactive=True, cross_origin=False, zindex=1)
-    image_overlay.add_to(m)
-
-    # Add vector layers
     vector_layers = data.get("vector_layers", np.array([], dtype=object))
+    if not hasattr(vector_layers, "tolist"):
+        vector_layers = np.array(vector_layers, dtype=object)
+
+    xs = []
+    ys = []
+    names = []
+    commodities = []
+    ids = []
+
     for lname in vector_layers.tolist():
         key = f"vector__{lname.replace(':', '__')}"
-        if key in data:
-            geojson_str = data[key].tolist() if hasattr(data[key], 'tolist') else data[key]
-            try:
-                geojson_obj = json.loads(geojson_str)
-                folium.GeoJson(geojson_obj, name=lname).add_to(m)
-            except Exception:
-                # If parsing fails, skip
-                pass
+        if key not in data:
+            continue
+        geojson_str = data[key].tolist() if hasattr(data[key], "tolist") else data[key]
+        try:
+            gdf = gpd.read_file(io.StringIO(geojson_str))
+        except Exception:
+            continue
+        if gdf.empty:
+            continue
+        if gdf.crs is None:
+            gdf = gdf.set_crs(epsg=4326)
+        else:
+            gdf = gdf.to_crs(epsg=4326)
 
-    folium.LayerControl().add_to(m)
-    m.save(out_map)
-    print(f"Saved interactive map to {out_map}")
+        if "commodity" in gdf.columns:
+            commodity_series = gdf["commodity"].astype(str)
+            gold_mask = commodity_series.str.contains(r"\bAu\b|gold", case=False, regex=True, na=False)
+        else:
+            gold_mask = np.ones(len(gdf), dtype=bool)
+
+        gold_gdf = gdf.loc[gold_mask].copy()
+        if gold_gdf.empty:
+            continue
+
+        for _, row in gold_gdf.iterrows():
+            geom = row.geometry
+            if geom is None or geom.is_empty:
+                continue
+            xs.append(geom.x)
+            ys.append(geom.y)
+            names.append(row.get("name", ""))
+            commodities.append(row.get("commodity", ""))
+            ids.append(row.get("id", ""))
+
+    if xs:
+        xs, ys = zip(*[lonlat_to_web_mercator(x, y) for x, y in zip(xs, ys)])
+    else:
+        xs, ys = [], []
+
+    return ColumnDataSource(
+        data={
+            "x": list(xs),
+            "y": list(ys),
+            "name": names,
+            "commodity": commodities,
+            "id": ids,
+        }
+    )
+
+
+def build_map(out_map=MAP_FILE):
+    prob_arr, x, y, dw, dh, bbox4326 = load_probability_grid(PROB_TIF_FILE)
+    gold_source = fetch_gold_points(bbox4326)
+    local_source = load_local_dataset_points(DATA_PKG)
+
+    output_file(out_map, title="Prospectivity Probability and Gold Occurrences")
+
+    p = figure(
+        x_axis_type="mercator",
+        y_axis_type="mercator",
+        width=1200,
+        height=900,
+        title="Probability Grid and Known Gold Occurrences",
+        tools="pan,wheel_zoom,reset,save",
+        active_scroll="wheel_zoom",
+    )
+    p.add_tile(WMTSTileSource(url="https://tile.openstreetmap.org/{Z}/{X}/{Y}.png"))
+
+    mapper = LinearColorMapper(palette=Turbo256, low=0.0, high=1.0, nan_color="#00000000")
+    p.image(image=[prob_arr], x=x, y=y, dw=dw, dh=dh, color_mapper=mapper, alpha=0.72)
+
+    gold_renderer = p.scatter(
+        x="x",
+        y="y",
+        source=gold_source,
+        marker="circle",
+        size=8,
+        color="#ffd700",
+        line_color="#7a5f00",
+        fill_alpha=0.95,
+        legend_label="Known gold occurrences (live WFS)",
+    )
+
+    local_renderer = p.scatter(
+        x="x",
+        y="y",
+        source=local_source,
+        marker="triangle",
+        size=7,
+        color="#00b894",
+        line_color="#00695c",
+        fill_alpha=0.80,
+        legend_label="Local dataset gold points",
+    )
+
+    hover = HoverTool(
+        renderers=[gold_renderer, local_renderer],
+        tooltips=[
+            ("Name", "@name"),
+            ("Commodity", "@commodity"),
+            ("ID", "@id"),
+        ],
+    )
+    p.add_tools(hover)
+
+    color_bar = ColorBar(color_mapper=mapper, ticker=BasicTicker(desired_num_ticks=6), label_standoff=10)
+    p.add_layout(color_bar, "right")
+
+    info = Div(
+        text=f"""
+        <div style="font-family: sans-serif; font-size: 13px; line-height: 1.4;">
+          <b>Reference grid:</b> probability_grid.tif<br>
+                    <b>Local dataset:</b> dataset_package.npz as the green triangle layer<br>
+          <b>Government layer:</b> live WFS `mo:MinOccView` filtered to Au/gold within the raster bounds<br>
+          <b>Map file:</b> {out_map}
+        </div>
+        """,
+        width=1200,
+    )
+
+    layout = column(info, p)
+    save(layout)
+    print(f"Saved layered map to {out_map}")
 
 
 if __name__ == "__main__":
-    try:
-        build_map()
-    except Exception as e:
-        print(f"Error: {e}")
-        print("If folium is missing, install: pip install folium")
-        print("For better PNG rendering install pillow and matplotlib: pip install pillow matplotlib")
+    build_map()
