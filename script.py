@@ -1,4 +1,5 @@
 import io
+import os
 import requests
 import re
 import numpy as np
@@ -15,6 +16,8 @@ class WAExplorationPipeline:
         self.raster_resolution_m = 30
         self.raster_wcs_url = "https://services.ga.gov.au/gis/machine-learning-models/wcs"
         self.raster_coverage_id = "ml__radmap_v4_2019_filtered_ML_pctk"
+        self.output_dir = "output"
+        os.makedirs(self.output_dir, exist_ok=True)
 
         self.to_meters = Transformer.from_crs("EPSG:4326", f"EPSG:{target_epsg}", always_xy=True)
         self.to_degrees = Transformer.from_crs(f"EPSG:{target_epsg}", "EPSG:4326", always_xy=True)
@@ -146,7 +149,7 @@ class WAExplorationPipeline:
             nan_grid = np.full((grid_size, grid_size), np.nan)
             return {"array": nan_grid, "transform": None, "crs": f"EPSG:{self.target_epsg}"}
 
-    def save_payload(self, payload, out_path="dataset_package.npz"):
+    def save_payload(self, payload, out_path=None):
         """Package vector GeoJSONs and raster array/metadata into a single .npz file.
 
         Vector layers are stored as GeoJSON strings under keys `vector__<layername>`
@@ -176,10 +179,11 @@ class WAExplorationPipeline:
 
         data["vector_layers"] = np.array(layer_names, dtype=object)
 
+        out_path = out_path or os.path.join(self.output_dir, "dataset_package.npz")
         np.savez_compressed(out_path, **data)
         print(f"-> Saved package to: {out_path}")
 
-    def save_raster_geotiff(self, raster_info, out_path="aster_quartz.tif", compress=True):
+    def save_raster_geotiff(self, raster_info, out_path=None, compress=True):
         """Save the extracted raster (numpy array + transform + crs) as a GeoTIFF file."""
         if raster_info is None:
             raise ValueError("raster_info is None")
@@ -209,6 +213,7 @@ class WAExplorationPipeline:
         if compress:
             profile.update({"tiled": True, "compress": "LZW", "blockxsize": 512, "blockysize": 512})
 
+        out_path = out_path or os.path.join(self.output_dir, "aster_quartz.tif")
         with rasterio.open(out_path, "w", **profile) as dst:
             dst.write(arr, 1)
 
@@ -266,11 +271,11 @@ if __name__ == "__main__":
         else:
             print(f"Mean Quartz Alteration: {np.nanmean(aster_data):.4f}")
 
-    # Save a single packaged file for downstream models
-    pipeline.save_payload(dataset_package, out_path="dataset_package.npz")
-    # Also save the raster as a GeoTIFF for GIS/model pipelines
+    # Save a single packaged file for downstream models (in output/)
+    pipeline.save_payload(dataset_package)
+    # Also save the raster as a GeoTIFF for GIS/model pipelines (in output/)
     try:
         if "aster_quartz" in dataset_package["raster"]:
-            pipeline.save_raster_geotiff(dataset_package["raster"]["aster_quartz"], out_path="aster_quartz.tif")
+            pipeline.save_raster_geotiff(dataset_package["raster"]["aster_quartz"])
     except Exception as e:
         print(f"❌ Failed to save GeoTIFF: {e}")
