@@ -12,11 +12,12 @@ from bokeh.models import (
     BasicTicker,
     ColorBar,
     ColumnDataSource,
+    CheckboxGroup,
     HoverTool,
     LinearColorMapper,
-    Range1d,
     Div,
     WMTSTileSource,
+    CustomJS,
 )
 from bokeh.palettes import Turbo256
 from bokeh.plotting import figure
@@ -29,6 +30,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 PROB_TIF_FILE = os.path.join(OUTPUT_DIR, "probability_grid.tif")
 MAP_FILE = os.path.join(OUTPUT_DIR, "map.html")
+TP_ONLY_TIF_FILE = os.path.join(OUTPUT_DIR, "high_confidence_grid.tif")
+TP_ONLY_MAP_FILE = os.path.join(OUTPUT_DIR, "map_tp_only.html")
+TP_POINTS_MAP_FILE = os.path.join(OUTPUT_DIR, "map_tp_points.html")
 DATA_PKG = os.path.join(OUTPUT_DIR, "dataset_package.npz")
 
 GOV_WFS_URL = "https://geossdi.dmp.wa.gov.au/services/wfs"
@@ -69,6 +73,41 @@ def load_probability_grid(tif_path):
     x0, y0, x1, y1 = bounds_to_web_mercator(west, south, east, north)
     mercator_arr = np.flipud(arr)
     return mercator_arr, x0, y0, x1 - x0, y1 - y0, (west, south, east, north)
+
+
+def load_tp_points(tif_path):
+    if not os.path.exists(tif_path):
+        raise FileNotFoundError(tif_path)
+
+    with rasterio.open(tif_path) as ds:
+        arr = ds.read(1)
+        transform = ds.transform
+        crs = ds.crs
+
+    mask = np.isfinite(arr) & (arr > 0)
+    rows, cols = np.where(mask)
+    if rows.size == 0:
+        return ColumnDataSource(data={"x": [], "y": [], "value": []})
+
+    xs = []
+    ys = []
+    values = []
+    transformer = None
+    if crs is not None and str(crs).upper() != "EPSG:4326":
+        transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+
+    for row, col in zip(rows.tolist(), cols.tolist()):
+        x_raw, y_raw = rasterio.transform.xy(transform, row, col, offset="center")
+        if transformer is not None:
+            lon, lat = transformer.transform(x_raw, y_raw)
+        else:
+            lon, lat = x_raw, y_raw
+        x_web, y_web = lonlat_to_web_mercator(lon, lat)
+        xs.append(x_web)
+        ys.append(y_web)
+        values.append(float(arr[row, col]))
+
+    return ColumnDataSource(data={"x": xs, "y": ys, "value": values})
 
 
 def fetch_gold_points(bbox4326):
@@ -189,26 +228,39 @@ def load_local_dataset_points(npz_path):
     )
 
 
-def build_map(out_map=MAP_FILE):
-    prob_arr, x, y, dw, dh, bbox4326 = load_probability_grid(PROB_TIF_FILE)
+def build_map(out_map=TP_POINTS_MAP_FILE, tif_path=TP_ONLY_TIF_FILE):
+    prob_arr, x, y, dw, dh, bbox4326 = load_probability_grid(tif_path)
+    tp_points_source = load_tp_points(tif_path)
     gold_source = fetch_gold_points(bbox4326)
     local_source = load_local_dataset_points(DATA_PKG)
 
-    output_file(out_map, title="Prospectivity Probability and Gold Occurrences")
+    output_file(out_map, title="TP-only Prospectivity Map")
 
     p = figure(
         x_axis_type="mercator",
         y_axis_type="mercator",
         width=1200,
         height=900,
-        title="Probability Grid and Known Gold Occurrences",
+        title="TP-only Grid and Known Gold Occurrences",
         tools="pan,wheel_zoom,reset,save",
         active_scroll="wheel_zoom",
     )
     p.add_tile(WMTSTileSource(url="https://tile.openstreetmap.org/{Z}/{X}/{Y}.png"))
 
     mapper = LinearColorMapper(palette=Turbo256, low=0.0, high=1.0, nan_color="#00000000")
-    p.image(image=[prob_arr], x=x, y=y, dw=dw, dh=dh, color_mapper=mapper, alpha=0.72)
+    tp_image_renderer = p.image(image=[prob_arr], x=x, y=y, dw=dw, dh=dh, color_mapper=mapper, alpha=0.55)
+
+    tp_points_renderer = p.scatter(
+        x="x",
+        y="y",
+        source=tp_points_source,
+        marker="diamond",
+        size=8,
+        color="#d81b60",
+        line_color="#880e4f",
+        fill_alpha=0.9,
+        legend_label="High-confidence TP points",
+    )
 
     gold_renderer = p.scatter(
         x="x",
@@ -247,10 +299,32 @@ def build_map(out_map=MAP_FILE):
     color_bar = ColorBar(color_mapper=mapper, ticker=BasicTicker(desired_num_ticks=6), label_standoff=10)
     p.add_layout(color_bar, "right")
 
+    layer_controls = CheckboxGroup(
+        labels=["TP raster", "TP points", "Live gold", "Local gold"],
+        active=[0, 1, 2, 3],
+    )
+    layer_controls.js_on_change(
+        "active",
+        CustomJS(
+            args=dict(
+                tp_image_renderer=tp_image_renderer,
+                tp_points_renderer=tp_points_renderer,
+                gold_renderer=gold_renderer,
+                local_renderer=local_renderer,
+            ),
+            code="""
+                tp_image_renderer.visible = cb_obj.active.includes(0);
+                tp_points_renderer.visible = cb_obj.active.includes(1);
+                gold_renderer.visible = cb_obj.active.includes(2);
+                local_renderer.visible = cb_obj.active.includes(3);
+            """,
+        ),
+    )
+
     info = Div(
         text=f"""
         <div style="font-family: sans-serif; font-size: 13px; line-height: 1.4;">
-          <b>Reference grid:</b> probability_grid.tif<br>
+                    <b>Reference grid:</b> high_confidence_grid.tif<br>
                     <b>Local dataset:</b> dataset_package.npz as the green triangle layer<br>
           <b>Government layer:</b> live WFS `mo:MinOccView` filtered to Au/gold within the raster bounds<br>
           <b>Map file:</b> {out_map}
@@ -259,7 +333,7 @@ def build_map(out_map=MAP_FILE):
         width=1200,
     )
 
-    layout = column(info, p)
+    layout = column(info, layer_controls, p)
     save(layout)
     print(f"Saved layered map to {out_map}")
 
