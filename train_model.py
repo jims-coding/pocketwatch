@@ -4,6 +4,15 @@ import numpy as np
 from rasterio.transform import Affine
 from pyproj import Transformer
 import geopandas as gpd
+import rasterio
+from rasterio.warp import reproject, Resampling
+
+# optional local stats/distance
+try:
+    from scipy import ndimage as ndi
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
 
 # scikit-learn imports will be used if available
 try:
@@ -19,13 +28,172 @@ OUTPUT_DIR = "output"
 NPZ_PATH = os.path.join(OUTPUT_DIR, "dataset_package.npz")
 MODEL_PATH = os.path.join(OUTPUT_DIR, "model.joblib")
 TRAIN_FRACTION = 0.5
+MAX_SAMPLE_DEPTH_M = 1.0
+SHALLOW_PROXY_METHODS = {
+    "gps observation (wgs-84/gda-94)",
+    "gps coordinates",
+    "copied point",
+    "aerial photograph",
+    "orthophotograph (mga)",
+}
+
+
+def _coerce_transform(value):
+    if value is None:
+        return None
+    array_value = np.asarray(value)
+    if array_value.size != 6:
+        return None
+    return tuple(float(x) for x in array_value.reshape(-1).tolist())
+
+
+def _coerce_crs(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    array_value = np.asarray(value)
+    if array_value.size == 0:
+        return None
+    if array_value.ndim == 0:
+        return str(array_value.item())
+    first_item = array_value.reshape(-1)[0]
+    return str(first_item)
+
+
+def _coerce_float(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() == "unknown":
+            return None
+        try:
+            return float(text)
+        except Exception:
+            return None
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def _is_gold_commodity(value):
+    text = str(value or "")
+    return ("Au" in text) or ("gold" in text.lower())
+
+
+def _sample_depth_from_row(row):
+    depth_keys = (
+        "sampleDepth_m",
+        "sampleDepth",
+        "depth_m",
+        "depth",
+        "intervalTo_m",
+        "to_m",
+        "upperDepth_m",
+        "boreholeLength_m",
+        "drillDepth_m",
+        "from_m",
+        "intervalFrom_m",
+    )
+    for key in depth_keys:
+        if key not in row:
+            continue
+        value = _coerce_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _filter_shallow_gold_rows(gdf, depth_limit_m=MAX_SAMPLE_DEPTH_M):
+    if gdf.empty:
+        return gdf, False
+
+    commodity_series = gdf["commodity"].astype(str) if "commodity" in gdf.columns else None
+    gold_mask = commodity_series.str.contains(r"\bAu\b|gold", case=False, regex=True, na=False) if commodity_series is not None else np.ones(len(gdf), dtype=bool)
+    gold_gdf = gdf.loc[gold_mask].copy()
+    if gold_gdf.empty:
+        return gold_gdf, False
+
+    keep_rows = []
+    depth_values = []
+    for idx, row in gold_gdf.iterrows():
+        depth_m = _sample_depth_from_row(row)
+        if depth_m is None:
+            depth_values.append(None)
+            keep_rows.append(False)
+            continue
+        depth_values.append(depth_m)
+        keep_rows.append(depth_m <= depth_limit_m)
+
+    depth_seen = any(value is not None for value in depth_values)
+    if not depth_seen:
+        if "observationMethod" not in gold_gdf.columns:
+            return gold_gdf.iloc[0:0].copy(), False
+
+        method_series = gold_gdf["observationMethod"].astype(str).str.strip().str.lower()
+        proxy_mask = method_series.isin(SHALLOW_PROXY_METHODS)
+        filtered = gold_gdf.loc[proxy_mask].copy()
+        return filtered, False
+
+    filtered = gold_gdf.loc[keep_rows].copy()
+    return filtered, True
 
 
 def load_package(npz_path):
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(npz_path)
-    data = np.load(npz_path, allow_pickle=True)
-    return data
+    # Try to load the .npz package; if it's corrupted or missing, fall back
+    # to any GeoTIFFs saved under output/rasters/ and vector GeoJSONs under output/.
+    if os.path.exists(npz_path):
+        try:
+            data = np.load(npz_path, allow_pickle=True)
+            return data
+        except Exception:
+            pass
+
+    # Fallback: build a lightweight NPZ-like object from output/rasters
+    rasters_dir = os.path.join(OUTPUT_DIR, "rasters")
+    mapping = {}
+    if os.path.isdir(rasters_dir):
+        for fn in sorted(os.listdir(rasters_dir)):
+            if fn.lower().endswith(".tif") or fn.lower().endswith('.tiff'):
+                key = f"raster__{os.path.splitext(fn)[0]}"
+                path = os.path.join(rasters_dir, fn)
+                try:
+                    with rasterio.open(path) as ds:
+                        arr = ds.read(1)
+                        transform = ds.transform
+                        crs = ds.crs
+                        mapping[key] = arr
+                        mapping[f"{key}__transform"] = np.array([transform.a, transform.b, transform.c, transform.d, transform.e, transform.f])
+                        mapping[f"{key}__crs"] = np.array([str(crs)])
+                except Exception:
+                    continue
+
+    # load vector geojson if present
+    for fn in sorted(os.listdir(OUTPUT_DIR)) if os.path.isdir(OUTPUT_DIR) else []:
+        if fn.lower().endswith('.geojson') or fn.lower().endswith('.json'):
+            key = f"vector__{os.path.splitext(fn)[0]}"
+            try:
+                with open(os.path.join(OUTPUT_DIR, fn), 'r', encoding='utf8') as f:
+                    mapping[key] = np.array(f.read(), dtype=object)
+            except Exception:
+                continue
+
+    class _NPZLike:
+        def __init__(self, mp):
+            self._mp = mp
+            self.files = list(mp.keys())
+        def __contains__(self, k):
+            return k in self._mp
+        def __getitem__(self, k):
+            return self._mp[k]
+        def get(self, k, default=None):
+            return self._mp.get(k, default)
+
+    return _NPZLike(mapping)
 
 
 def find_occurrence_key(data):
@@ -43,26 +211,87 @@ def find_occurrence_key(data):
 
 
 def prepare_training_data(data):
-    # Load raster
-    if "raster" not in data:
-        raise RuntimeError("No raster in package")
-    raster = data["raster"]
-    transform_arr = data.get("raster_transform", np.array([]))
-    raster_crs = data.get("raster_crs", np.array([None]))
-    # raster_crs may be stored as a numpy array containing a string, or as a scalar string
-    if hasattr(raster_crs, "tolist"):
-        rc_val = raster_crs.tolist()
-        if isinstance(rc_val, (list, tuple, np.ndarray)):
-            raster_crs = rc_val[0] if len(rc_val) > 0 else None
-        else:
-            raster_crs = rc_val
+    # Load base raster (reference grid). Prefer explicit 'raster', fallback to first raster__* available
+    if "raster" in data:
+        raster = data["raster"]
+        transform_arr = data.get("raster_transform", np.array([]))
+        raster_crs = data.get("raster_crs", np.array([None]))
     else:
-        raster_crs = raster_crs
+        # find first raster__ key that is an array (not __crs or __transform)
+        base_key = None
+        for k in data.files:
+            if k.startswith("raster__") and not k.endswith("__crs") and not k.endswith("__transform"):
+                base_key = k
+                break
+        if base_key is None:
+            raise RuntimeError("No raster in package")
+        raster = data[base_key]
+        transform_arr = data.get(f"{base_key}__transform", np.array([]))
+        raster_crs = data.get(f"{base_key}__crs", np.array([None]))
+    # raster_crs may be stored as a numpy array containing a string, or as a scalar string
+    raster_crs = _coerce_crs(raster_crs)
 
     if raster is None:
         raise RuntimeError("Raster is empty")
 
     height, width = raster.shape
+
+    # Prepare list of desired rasters to use as predictors (medians + oxides medians)
+    desired_prefixes = [
+        "ml_nat_conductivity__national_0_4m_conductivity_prediction_median",
+        "ml_nat_conductivity__national_30m_conductivity_prediction_median",
+    ]
+    # add oxide medians
+    for k in data.files:
+        if k.startswith("raster__ml_oxides__") and k.endswith("_prediction_median"):
+            name = k.replace("raster__", "")
+            desired_prefixes.append(name)
+
+    # ensure unique and available
+    desired = []
+    for name in desired_prefixes:
+        key = f"raster__{name}"
+        if key in data.files:
+            desired.append((name, key))
+
+    if len(desired) == 0:
+        raise RuntimeError("No desired predictor rasters found in package")
+
+    # helper: resample source array to destination grid
+    def resample_to_base(src_arr, src_transform, src_crs, dst_shape, dst_transform, dst_crs):
+        dst = np.full(dst_shape, np.nan, dtype=float)
+        if src_arr is None:
+            return dst
+        # construct affine transforms as rasterio expects
+        src_transform_affine = _coerce_transform(src_transform)
+        dst_transform_affine = _coerce_transform(dst_transform)
+        try:
+            reproject(
+                source=src_arr,
+                destination=dst,
+                src_transform=Affine(*src_transform_affine) if src_transform_affine is not None else None,
+                src_crs=_coerce_crs(src_crs),
+                dst_transform=Affine(*dst_transform_affine) if dst_transform_affine is not None else None,
+                dst_crs=_coerce_crs(dst_crs),
+                resampling=Resampling.bilinear,
+                num_threads=2,
+            )
+        except Exception:
+            # fallback: try nearest
+            try:
+                reproject(
+                    source=src_arr,
+                    destination=dst,
+                    src_transform=Affine(*src_transform_affine) if src_transform_affine is not None else None,
+                    src_crs=_coerce_crs(src_crs),
+                    dst_transform=Affine(*dst_transform_affine) if dst_transform_affine is not None else None,
+                    dst_crs=_coerce_crs(dst_crs),
+                    resampling=Resampling.nearest,
+                    num_threads=2,
+                )
+            except Exception:
+                pass
+        return dst
 
     # Build pixel grid features across the full AOI
     rows, cols = np.indices(raster.shape)
@@ -71,9 +300,38 @@ def prepare_training_data(data):
     if valid_mask.sum() == 0:
         raise RuntimeError("Raster contains only NaN")
 
+    # resample each desired raster to base grid and collect arrays
+    feature_arrays = []
+    feature_names = []
+    dst_shape = raster.shape
+    dst_transform = transform_arr
+    dst_crs = _coerce_crs(raster_crs)
+    for name, key in desired:
+        try:
+            arr = data[key]
+            t_key = f"{key}__transform"
+            c_key = f"{key}__crs"
+            src_transform = data[t_key] if t_key in data.files else None
+            src_crs = _coerce_crs(data[c_key]) if c_key in data.files else None
+            res = resample_to_base(arr, src_transform, src_crs, dst_shape, dst_transform, dst_crs)
+            # convert nodata to nan
+            res = res.astype(float)
+            feature_arrays.append(res)
+            feature_names.append(name)
+        except Exception:
+            continue
+
+    # stack features into (n_pixels, n_features)
+    stacked = np.stack([a.flatten() for a in feature_arrays], axis=1) if len(feature_arrays) > 0 else np.zeros((raster.size, 0))
+    # mask valid by base raster
+    valid_mask = ~np.isnan(stacked).all(axis=1) & (~np.isnan(values))
+    if valid_mask.sum() == 0:
+        raise RuntimeError("No valid pixels after stacking features")
+
     rows_f = rows.flatten()[valid_mask]
     cols_f = cols.flatten()[valid_mask]
     vals_f = values[valid_mask]
+    stacked_f = stacked[valid_mask]
 
     # Prepare labels by mapping occurrence points to pixel indices
     occ_key = find_occurrence_key(data)
@@ -90,14 +348,19 @@ def prepare_training_data(data):
     if gdf.empty:
         raise RuntimeError("No valid geometries in occurrences")
 
+    gdf, depth_filtered = _filter_shallow_gold_rows(gdf, MAX_SAMPLE_DEPTH_M)
+    if gdf.empty:
+        if depth_filtered:
+            raise RuntimeError("No known gold samples remain after applying the 1 m shallow cutoff")
+        raise RuntimeError("The current gold layer does not expose a usable depth field, so shallow gold labels cannot be enforced")
+
     # Transform occurrence coords to raster CRS if needed
     occ_coords = [(pt.x, pt.y) for pt in gdf.geometry]
 
     if raster_crs is None:
         raster_crs = "EPSG:4326"
-
-    if isinstance(raster_crs, np.ndarray) or isinstance(raster_crs, list):
-        raster_crs = str(raster_crs[0]) if len(raster_crs) > 0 else "EPSG:4326"
+    else:
+        raster_crs = _coerce_crs(raster_crs) or "EPSG:4326"
 
     if raster_crs.upper().startswith("EPSG"):
         src_crs = "EPSG:4326"
@@ -169,7 +432,11 @@ def prepare_training_data(data):
     if labels.sum() == 0:
         print("Warning: No positive labels found from occurrences; model training will be trivial.")
 
-    X_full = vals_f.reshape(-1, 1)
+    # assemble feature matrix: include stacked predictors + base raster quartz-like value as first column
+    if stacked_f.shape[1] > 0:
+        X_full = np.hstack([stacked_f])
+    else:
+        X_full = vals_f.reshape(-1, 1)
 
     rng = np.random.default_rng(42)
 
@@ -202,7 +469,9 @@ def main():
         raise RuntimeError("scikit-learn is not installed in the environment. Install: pip install scikit-learn")
 
     X, y = prepare_training_data(data)
-    print(f"Prepared training data (50% subsample, quartz-only): X={X.shape}, y={y.shape}, positives={y.sum()}")
+    print(
+        f"Prepared training data (50% subsample, shallow gold): X={X.shape}, y={y.shape}, positives={y.sum()}"
+    )
 
     # Simple train/test split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y if y.sum()>0 else None)

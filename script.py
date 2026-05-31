@@ -2,6 +2,7 @@ import io
 import os
 import requests
 import re
+import time
 import numpy as np
 import geopandas as gpd
 from pyproj import Transformer
@@ -101,53 +102,195 @@ class WAExplorationPipeline:
             print(f"❌ WFS Network Error: {e}")
             return None
 
-    def pull_aster_ga_wcs(self, bbox_str):
-        """Pull a public GA raster coverage via WCS and read it in memory."""
-        print("-> Pulling public GA raster via WCS...")
-
-        lon_min, lat_min, lon_max, lat_max = bbox_str.split(",")
-        params = [
-            ("service", "WCS"),
-            ("version", "2.0.1"),
-            ("request", "GetCoverage"),
-            ("coverageId", self.raster_coverage_id),
-            ("format", "image/tiff"),
-            ("subset", f"Lat({lat_min},{lat_max})"),
-            ("subset", f"Long({lon_min},{lon_max})"),
-        ]
-
+    def list_wcs_coverages(self):
+        """Return a list of available coverage IDs from the GA WCS GetCapabilities."""
         try:
-            response = requests.get(self.raster_wcs_url, params=params, timeout=120)
-            response.raise_for_status()
-
-            content_type = response.headers.get("content-type", "").lower()
-            if not content_type.startswith("image/"):
-                print(f"   ⚠️ Unexpected raster response: {content_type}")
-                print(f"   ⚠️ Response head: {response.text[:300]}")
-                raise ValueError("WCS did not return an image/tiff payload")
-
-            with MemoryFile(response.content) as memfile:
-                with memfile.open() as dataset:
-                    raster_array = dataset.read(1).astype(float)
-                    nodata = dataset.nodata
-                    if nodata is not None:
-                        raster_array = np.where(raster_array == nodata, np.nan, raster_array)
-                    transform = (
-                        float(dataset.transform.a),
-                        float(dataset.transform.b),
-                        float(dataset.transform.c),
-                        float(dataset.transform.d),
-                        float(dataset.transform.e),
-                        float(dataset.transform.f),
-                    )
-                    crs = str(dataset.crs) if dataset.crs is not None else None
-                    return {"array": raster_array, "transform": transform, "crs": crs}
-
+            resp = requests.get(self.raster_wcs_url, params={"service": "WCS", "request": "GetCapabilities", "version": "2.0.1"}, timeout=30)
+            resp.raise_for_status()
+            txt = resp.text
+            covs = set(re.findall(r'<wcs:CoverageId>(.*?)</wcs:CoverageId>', txt))
+            if not covs:
+                covs = set(re.findall(r'<CoverageId>(.*?)</CoverageId>', txt))
+            if not covs:
+                covs = set(re.findall(r'coverageId="(.*?)"', txt))
+            return sorted(list(covs))
         except Exception as e:
-            print(f"❌ Raster Error: {e}")
-            grid_size = int(round(2000 / self.raster_resolution_m))
-            nan_grid = np.full((grid_size, grid_size), np.nan)
-            return {"array": nan_grid, "transform": None, "crs": f"EPSG:{self.target_epsg}"}
+            print(f"❌ WCS GetCapabilities error: {e}")
+            return [self.raster_coverage_id]
+
+
+    def pull_wcs_coverage(self, bbox_str, coverage_id):
+        """Pull a single GA WCS coverage by ID and return array/transform/crs."""
+        print(f"-> Pulling WCS coverage: {coverage_id}")
+        lon_min, lat_min, lon_max, lat_max = bbox_str.split(",")
+
+        # Try to discover coverage CRS and axis labels via DescribeCoverage
+        axis_labels = None
+        target_crs_code = None
+        try:
+            desc = requests.get(self.raster_wcs_url, params={"service": "WCS", "request": "DescribeCoverage", "version": "2.0.1", "coverageId": coverage_id}, timeout=30)
+            desc.raise_for_status()
+            txt = desc.text
+            # Look for gml:Envelope srsName and axisLabels
+            m = re.search(r'<gml:Envelope[^>]*srsName="([^"]+)"[^>]*axisLabels="([^"]+)"', txt)
+            if m:
+                srs = m.group(1)
+                axis_labels = m.group(2).split()
+                # try to extract EPSG code
+                m2 = re.search(r'EPSG(?:/0/|/)(\d+)', srs)
+                if m2:
+                    target_crs_code = int(m2.group(1))
+        except Exception:
+            axis_labels = None
+
+        # Build candidate subset parameter combinations to try (order matters)
+        attempts = []
+
+        # helper to build base params with optional subset tuples
+        def base_params(subs=None):
+            p = [
+                ("service", "WCS"),
+                ("version", "2.0.1"),
+                ("request", "GetCoverage"),
+                ("coverageId", coverage_id),
+                ("format", "image/tiff"),
+            ]
+            if subs:
+                p.extend(subs)
+            return p
+
+        # If we discovered axis labels and a coverage CRS, prepare transformed numeric bounds
+        transformed_bounds = None
+        if axis_labels and target_crs_code is not None:
+            try:
+                from pyproj import Transformer as _Transformer
+                transformer = _Transformer.from_crs("EPSG:4326", f"EPSG:{target_crs_code}", always_xy=True)
+                x1, y1 = transformer.transform(float(lon_min), float(lat_min))
+                x2, y2 = transformer.transform(float(lon_max), float(lat_max))
+                a_min = min(x1, x2)
+                a_max = max(x1, x2)
+                b_min = min(y1, y2)
+                b_max = max(y1, y2)
+                transformed_bounds = (a_min, a_max, b_min, b_max)
+            except Exception:
+                transformed_bounds = None
+
+        # Common candidate subsets (prefer coverage axisLabels when available)
+        if axis_labels and transformed_bounds:
+            a_min, a_max, b_min, b_max = transformed_bounds
+            # Primary: axis labels in discovered order
+            subs = [("subset", f"{axis_labels[0]}({a_min},{a_max})"), ("subset", f"{axis_labels[1]}({b_min},{b_max})")]
+            attempts.append(base_params(subs))
+            # swapped order
+            subs_swapped = [("subset", f"{axis_labels[1]}({b_min},{b_max})"), ("subset", f"{axis_labels[0]}({a_min},{a_max})")]
+            attempts.append(base_params(subs_swapped))
+
+        # Try common Lat/Long variants using geographic coords
+        latlong = [("subset", f"Lat({lat_min},{lat_max})"), ("subset", f"Long({lon_min},{lon_max})")]
+        attempts.append(base_params(latlong))
+        attempts.append(base_params(list(reversed(latlong))))
+        attempts.append(base_params([("subset", f"lat({lat_min},{lat_max})"), ("subset", f"long({lon_min},{lon_max})")]))
+
+        # If discovered axis labels but no transformation (e.g., axisLabels 'Lat Long'), try using numeric degrees with those labels
+        if axis_labels and not transformed_bounds:
+            try:
+                subs_deg = [("subset", f"{axis_labels[0]}({lat_min},{lat_max})"), ("subset", f"{axis_labels[1]}({lon_min},{lon_max})")]
+                attempts.append(base_params(subs_deg))
+            except Exception:
+                pass
+
+        # Fallback: no subset (full coverage)
+        attempts.append(base_params(None))
+
+        # Also attempt lowercase axis names for discovered labels
+        if axis_labels:
+            lower = [lbl.lower() for lbl in axis_labels]
+            try:
+                if transformed_bounds:
+                    subs = [("subset", f"{lower[0]}({a_min},{a_max})"), ("subset", f"{lower[1]}({b_min},{b_max})")]
+                    attempts.append(base_params(subs))
+            except Exception:
+                pass
+
+        last_error = None
+        for idx, params_try in enumerate(attempts):
+            try:
+                # small backoff for repeated attempts
+                if idx > 0:
+                    time.sleep(min(1.0, 0.2 * idx))
+
+                response = requests.get(self.raster_wcs_url, params=params_try, timeout=120)
+                # if server returns XML error, we may want to inspect and continue
+                if response.status_code >= 400:
+                    txt = response.text or ""
+                    # if InvalidAxisLabel, try next attempt
+                    if "InvalidAxisLabel" in txt or "Invalid axis label" in txt:
+                        last_error = txt.strip()[:300]
+                        continue
+                    else:
+                        last_error = f"HTTP {response.status_code}: {txt.strip()[:300]}"
+                        continue
+
+                content_type = response.headers.get("content-type", "").lower()
+                if not content_type.startswith("image/"):
+                    last_error = f"Unexpected content-type: {content_type}"
+                    # if XML with exception, try next
+                    continue
+
+                # Got an image payload; try to read it
+                with MemoryFile(response.content) as memfile:
+                    with memfile.open() as dataset:
+                        raster_array = dataset.read(1).astype(float)
+                        nodata = dataset.nodata
+                        if nodata is not None:
+                            raster_array = np.where(raster_array == nodata, np.nan, raster_array)
+                        transform = (
+                            float(dataset.transform.a),
+                            float(dataset.transform.b),
+                            float(dataset.transform.c),
+                            float(dataset.transform.d),
+                            float(dataset.transform.e),
+                            float(dataset.transform.f),
+                        )
+                        crs = str(dataset.crs) if dataset.crs is not None else None
+                        return {"array": raster_array, "transform": transform, "crs": crs}
+
+            except Exception as e:
+                last_error = str(e)
+                continue
+
+        # If we reach here, all attempts failed. Try to find a direct link in DescribeCoverage text (common for radmap S3 GeoTIFF staging)
+        try:
+            desc = requests.get(self.raster_wcs_url, params={"service": "WCS", "request": "DescribeCoverage", "version": "2.0.1", "coverageId": coverage_id}, timeout=30)
+            desc.raise_for_status()
+            urls = re.findall(r'https?://[^"\s]+\\.tif(?:f)?', desc.text)
+            for u in urls:
+                try:
+                    r2 = requests.get(u, timeout=120)
+                    r2.raise_for_status()
+                    with MemoryFile(r2.content) as memfile:
+                        with memfile.open() as dataset:
+                            raster_array = dataset.read(1).astype(float)
+                            nodata = dataset.nodata
+                            if nodata is not None:
+                                raster_array = np.where(raster_array == nodata, np.nan, raster_array)
+                            transform = (
+                                float(dataset.transform.a),
+                                float(dataset.transform.b),
+                                float(dataset.transform.c),
+                                float(dataset.transform.d),
+                                float(dataset.transform.e),
+                                float(dataset.transform.f),
+                            )
+                            crs = str(dataset.crs) if dataset.crs is not None else None
+                            return {"array": raster_array, "transform": transform, "crs": crs}
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        print(f"❌ Raster Error for {coverage_id}: {last_error}")
+        return None
 
     def save_payload(self, payload, out_path=None):
         """Package vector GeoJSONs and raster array/metadata into a single .npz file.
@@ -171,11 +314,26 @@ class WAExplorationPipeline:
                 geojson = "{}"
             data[key] = np.array(geojson, dtype=object)
 
-        raster_info = payload.get("raster", {}).get("aster_quartz")
-        if raster_info is not None:
-            data["raster"] = raster_info.get("array")
-            data["raster_transform"] = np.array(raster_info.get("transform"), dtype=float) if raster_info.get("transform") is not None else np.array([], dtype=float)
-            data["raster_crs"] = np.array(raster_info.get("crs"), dtype=object)
+        # Save all raster coverages found in the payload; keep the configured primary coverage
+        raster_dict = payload.get("raster", {})
+        primary = self.raster_coverage_id
+        primary_info = raster_dict.get(primary)
+        if primary_info is not None:
+            data["raster"] = primary_info.get("array")
+            data["raster_transform"] = np.array(primary_info.get("transform"), dtype=float) if primary_info.get("transform") is not None else np.array([], dtype=float)
+            data["raster_crs"] = np.array(primary_info.get("crs"), dtype=object)
+
+        # Also store each coverage explicitly under a raster__<id> key for downstream use
+        for cov_id, info in raster_dict.items():
+            key = f"raster__{cov_id.replace(':', '__')}"
+            try:
+                if info is None:
+                    continue
+                data[key] = info.get("array")
+                data[f"{key}__transform"] = np.array(info.get("transform"), dtype=float) if info.get("transform") is not None else np.array([], dtype=float)
+                data[f"{key}__crs"] = np.array(info.get("crs"), dtype=object)
+            except Exception:
+                continue
 
         data["vector_layers"] = np.array(layer_names, dtype=object)
 
@@ -228,9 +386,16 @@ class WAExplorationPipeline:
             if gdf is not None:
                 feature_payload["vector"][v_layer] = gdf
         
-        arr_info = self.pull_aster_ga_wcs(bbox_str)
-        if arr_info is not None:
-            feature_payload["raster"]["aster_quartz"] = arr_info
+        # Discover available coverages and pull each one (may be large)
+        coverages = self.list_wcs_coverages()
+        for cov in coverages:
+            info = self.pull_wcs_coverage(bbox_str, cov)
+            if info is not None:
+                feature_payload["raster"][cov] = info
+
+        # For backward compatibility, expose the configured quartz coverage under the key 'aster_quartz'
+        if self.raster_coverage_id in feature_payload["raster"]:
+            feature_payload["raster"]["aster_quartz"] = feature_payload["raster"][self.raster_coverage_id]
                 
         return feature_payload
 
