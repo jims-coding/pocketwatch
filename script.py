@@ -7,6 +7,7 @@ import time
 import numpy as np
 import geopandas as gpd
 from pyproj import Transformer
+from rasterio.warp import transform_bounds
 import rasterio
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
@@ -144,8 +145,9 @@ class WAExplorationPipeline:
         except Exception:
             axis_labels = None
 
-        # Build candidate subset parameter combinations to try (order matters)
-        attempts = []
+        # Build candidate subset parameter combinations to try (order matters).
+        # We'll request the full coverage first (safer) by initializing
+        # `attempts` with that entry after we define `base_params`.
 
         # helper to build base params with optional subset tuples
         def base_params(subs=None):
@@ -159,6 +161,9 @@ class WAExplorationPipeline:
             if subs:
                 p.extend(subs)
             return p
+
+        # Start attempts with a full GetCoverage request (no subsetting).
+        attempts = [base_params(None)]
 
         # If we discovered axis labels and a coverage CRS, prepare transformed numeric bounds
         transformed_bounds = None
@@ -383,6 +388,12 @@ class WAExplorationPipeline:
         keys produced under `output/rasters` (without the .tif extension).
         """
         bbox_str = self.calculate_bbox(lat, lon)
+        # parse bbox into numeric tuple (west, south, east, north)
+        try:
+            lon_min, lat_min, lon_max, lat_max = [float(x) for x in bbox_str.split(',')]
+            bbox_deg = (lon_min, lat_min, lon_max, lat_max)
+        except Exception:
+            bbox_deg = None
         feature_payload = {"vector": {}, "raster": {}}
 
         # If no requested_rasters provided, try loading src_layers.json from
@@ -419,16 +430,133 @@ class WAExplorationPipeline:
                 return (cov_id.replace(':', '__') in requested_set) or (cov_id.replace(':', '__') == primary_name)
             coverages = [c for c in coverages if wanted(c)]
 
+        # Keep original list for possible fallback
+        coverages_original = list(coverages)
+
         for cov in coverages:
             info = self.pull_wcs_coverage(bbox_str, cov)
-            if info is not None:
-                feature_payload["raster"][cov] = info
+            if info is None:
+                continue
 
+            # If raster doesn't fully cover AOI, try to crop it to the AOI and accept partial coverage.
+            try:
+                if bbox_deg is not None and not self._raster_covers_bbox(info, bbox_deg):
+                    cropped = self._crop_raster_to_bbox(info, bbox_deg)
+                    if cropped is None:
+                        print(f"   Warning: coverage {cov} has no overlap with AOI; skipping")
+                        continue
+                    print(f"   Note: coverage {cov} partially covers AOI; cropping to AOI")
+                    info = cropped
+            except Exception:
+                # best-effort: accept info as-is
+                pass
+
+            feature_payload["raster"][cov] = info
+        # If the user requested a restricted set (e.g. from a model) but none
+        # of those restricted coverages produced usable rasters that covered
+        # the AOI, fall back to attempting full downloads for all coverages.
+        if requested_rasters and len(feature_payload.get("raster", {})) == 0:
+            print("   Notice: restricted raster download returned no usable coverages; falling back to full coverage attempts")
+            for cov in coverages_original:
+                try:
+                    info = self.pull_wcs_coverage(bbox_str, cov)
+                    if info is not None:
+                        # accept it even if coverage check failed earlier
+                        feature_payload["raster"][cov] = info
+                except Exception:
+                    continue
+        # Persist the requested AOI bbox for downstream steps (predict/map)
+        try:
+            if bbox_deg is not None:
+                out_json = os.path.join(self.output_dir, "aoi_bbox.json")
+                with open(out_json, "w", encoding="utf8") as fh:
+                    json.dump({"bbox_4326": list(bbox_deg)}, fh)
+        except Exception:
+            pass
         # For backward compatibility, expose the configured quartz coverage under the key 'aster_quartz'
         if self.raster_coverage_id in feature_payload["raster"]:
             feature_payload["raster"]["aster_quartz"] = feature_payload["raster"][self.raster_coverage_id]
                 
         return feature_payload
+
+    def _raster_covers_bbox(self, raster_info, bbox4326):
+        """Return True if raster_info covers bbox4326 (west,south,east,north).
+
+        raster_info is expected to include keys: 'array', 'transform' (6-tuple), and 'crs' (string or None).
+        """
+        try:
+            arr = raster_info.get("array")
+            t = raster_info.get("transform")
+            crs = raster_info.get("crs") or f"EPSG:{self.target_epsg}"
+            if arr is None or t is None:
+                return False
+            h, w = arr.shape
+            affine = Affine(*t)
+            minx, miny, maxx, maxy = rasterio.transform.array_bounds(h, w, affine)
+            # transform to 4326
+            gb = transform_bounds(crs, "EPSG:4326", minx, miny, maxx, maxy, densify_pts=21)
+            # check containment (allow tiny epsilon)
+            eps = 1e-6
+            return (gb[0] <= bbox4326[0] + eps) and (gb[1] <= bbox4326[1] + eps) and (gb[2] >= bbox4326[2] - eps) and (gb[3] >= bbox4326[3] - eps)
+        except Exception:
+            return False
+
+    def _crop_raster_to_bbox(self, raster_info, bbox4326):
+        """Crop raster_info to the bbox (west,south,east,north) in EPSG:4326.
+
+        Returns a new raster_info dict with 'array', 'transform', 'crs' if any overlap,
+        otherwise returns None.
+        """
+        try:
+            arr = raster_info.get("array")
+            t = raster_info.get("transform")
+            crs = raster_info.get("crs") or f"EPSG:{self.target_epsg}"
+            if arr is None or t is None:
+                return None
+
+            a, b, c, d, e, f = t
+            affine = Affine(a, b, c, d, e, f)
+            h, w = arr.shape
+
+            # transform AOI bbox into raster CRS
+            try:
+                from pyproj import Transformer as _Transformer
+                transformer = _Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                x_min, y_min = transformer.transform(bbox4326[0], bbox4326[1])
+                x_max, y_max = transformer.transform(bbox4326[2], bbox4326[3])
+                # ensure ordering
+                rx_min, rx_max = min(x_min, x_max), max(x_min, x_max)
+                ry_min, ry_max = min(y_min, y_max), max(y_min, y_max)
+            except Exception:
+                return None
+
+            # compute pixel indices for AOI bounds using inverse affine
+            inv = ~affine
+            col_min_f, row_min_f = inv * (rx_min, ry_max)
+            col_max_f, row_max_f = inv * (rx_max, ry_min)
+
+            col_min = int(np.floor(min(col_min_f, col_max_f)))
+            col_max = int(np.ceil(max(col_min_f, col_max_f)))
+            row_min = int(np.floor(min(row_min_f, row_max_f)))
+            row_max = int(np.ceil(max(row_min_f, row_max_f)))
+
+            # clamp to raster bounds
+            col_min = max(0, col_min)
+            row_min = max(0, row_min)
+            col_max = min(w - 1, col_max)
+            row_max = min(h - 1, row_max)
+
+            if col_min > col_max or row_min > row_max:
+                return None
+
+            cropped = arr[row_min:row_max + 1, col_min:col_max + 1]
+            new_c = c + a * col_min + b * row_min
+            new_f = f + d * col_min + e * row_min
+            new_transform = (a, b, new_c, d, e, new_f)
+
+            return {"array": cropped, "transform": new_transform, "crs": crs}
+        except Exception:
+            return None
 
 if __name__ == "__main__":
     pipeline = WAExplorationPipeline(target_epsg=7851)

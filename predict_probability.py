@@ -336,11 +336,12 @@ def main():
 
     positive_proba = proba[:, 1].astype(np.float32)
 
-    prob_grid = np.full(base_raster.size, np.nan, dtype=np.float32)
-    # Only write probabilities where every predictor overlaps.
-    prob_grid[overlap_mask] = np.nan
-    prob_grid[valid_mask] = positive_proba
-    prob_grid = prob_grid.reshape(base_raster.shape)
+    prob_flat = np.full(base_raster.size, np.nan, dtype=np.float32)
+    # Write probabilities for the pixels with valid features (as used to build X)
+    prob_flat[valid_mask] = positive_proba
+    # Enforce the overlap mask before reshaping.
+    prob_flat[~overlap_mask] = np.nan
+    prob_grid = prob_flat.reshape(base_raster.shape)
 
     overlap_grid = np.zeros(base_raster.size, dtype=np.uint8)
     overlap_grid[overlap_mask] = 1

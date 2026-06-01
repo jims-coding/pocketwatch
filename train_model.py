@@ -314,10 +314,22 @@ def prepare_training_data(data):
 
     # stack features into (n_pixels, n_features)
     stacked = np.stack([a.flatten() for a in feature_arrays], axis=1) if len(feature_arrays) > 0 else np.zeros((raster.size, 0))
-    # Keep only pixels where every predictor is available and the base raster is valid.
-    valid_mask = (~np.isnan(stacked).any(axis=1)) & (~np.isnan(values))
+    # Compute overlap mask from the resampled predictor arrays (same logic used at prediction time)
+    mask_arrays = [np.isfinite(a).flatten() for a in feature_arrays] if len(feature_arrays) > 0 else [~np.isnan(values)]
+    overlap_mask = np.logical_and.reduce(mask_arrays)
+    # Keep only pixels where every predictor is available (overlap) and the base raster is valid.
+    valid_mask = overlap_mask & (~np.isnan(values))
     if valid_mask.sum() == 0:
         raise RuntimeError("No valid pixels after stacking features")
+
+    # Save training valid-mask for verification (pixels used for training).
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        np.save(os.path.join(OUTPUT_DIR, "train_valid_mask.npy"), valid_mask.astype(np.uint8))
+        # also save the computed overlap mask for reference
+        np.save(os.path.join(OUTPUT_DIR, "computed_overlap_mask.npy"), overlap_mask.astype(np.uint8))
+    except Exception:
+        pass
 
     rows_f = rows.flatten()[valid_mask]
     cols_f = cols.flatten()[valid_mask]
