@@ -301,6 +301,8 @@ class WAExplorationPipeline:
         """
         data = {}
         layer_names = []
+        rasters_dir = os.path.join(self.output_dir, "rasters")
+        os.makedirs(rasters_dir, exist_ok=True)
 
         for lname, gdf in payload.get("vector", {}).items():
             layer_names.append(lname)
@@ -332,14 +334,24 @@ class WAExplorationPipeline:
                 data[key] = info.get("array")
                 data[f"{key}__transform"] = np.array(info.get("transform"), dtype=float) if info.get("transform") is not None else np.array([], dtype=float)
                 data[f"{key}__crs"] = np.array(info.get("crs"), dtype=object)
+                try:
+                    tif_path = os.path.join(rasters_dir, f"{cov_id.replace(':', '__')}.tif")
+                    self.save_raster_geotiff(info, out_path=tif_path)
+                except Exception:
+                    pass
             except Exception:
                 continue
 
         data["vector_layers"] = np.array(layer_names, dtype=object)
 
         out_path = out_path or os.path.join(self.output_dir, "dataset_package.npz")
-        np.savez_compressed(out_path, **data)
-        print(f"-> Saved package to: {out_path}")
+        try:
+            np.savez_compressed(out_path, **data)
+            print(f"-> Saved package to: {out_path}")
+        except MemoryError:
+            print(f"⚠️ Skipped saving {out_path}: compressed package is too large for available memory.")
+        except Exception as e:
+            print(f"⚠️ Skipped saving {out_path}: {e}")
 
     def save_raster_geotiff(self, raster_info, out_path=None, compress=True):
         """Save the extracted raster (numpy array + transform + crs) as a GeoTIFF file."""
@@ -413,9 +425,14 @@ if __name__ == "__main__":
     target_lat = -30.7489
     target_lon = 121.4658
 
+    #kalgoolie
     target_lat = -30.7766
     target_lon = 121.5065
-    
+
+    #leonora
+    #target_lat = -28.8851
+    #target_lon = 121.3283
+
     print(f"\n--- 🚀 STEP 2: RUNNING PIPELINE FOR TARGET ({target_lat}, {target_lon}) ---")
     dataset_package = pipeline.execute_pipeline(target_lat, target_lon, v_targets)
     

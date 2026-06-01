@@ -132,11 +132,15 @@ def _filter_shallow_gold_rows(gdf, depth_limit_m=MAX_SAMPLE_DEPTH_M):
     depth_seen = any(value is not None for value in depth_values)
     if not depth_seen:
         if "observationMethod" not in gold_gdf.columns:
-            return gold_gdf.iloc[0:0].copy(), False
+            print("Warning: no depth metadata found in the current gold layer; using gold-bearing sites without a confirmed 1 m cutoff.")
+            return gold_gdf.copy(), False
 
         method_series = gold_gdf["observationMethod"].astype(str).str.strip().str.lower()
         proxy_mask = method_series.isin(SHALLOW_PROXY_METHODS)
         filtered = gold_gdf.loc[proxy_mask].copy()
+        if filtered.empty:
+            print("Warning: no shallow proxy methods matched; using all gold-bearing sites without a confirmed 1 m cutoff.")
+            return gold_gdf.copy(), False
         return filtered, False
 
     filtered = gold_gdf.loc[keep_rows].copy()
@@ -236,26 +240,20 @@ def prepare_training_data(data):
 
     height, width = raster.shape
 
-    # Prepare list of desired rasters to use as predictors (medians + oxides medians)
-    desired_prefixes = [
-        "ml_nat_conductivity__national_0_4m_conductivity_prediction_median",
-        "ml_nat_conductivity__national_30m_conductivity_prediction_median",
-    ]
-    # add oxide medians
-    for k in data.files:
-        if k.startswith("raster__ml_oxides__") and k.endswith("_prediction_median"):
-            name = k.replace("raster__", "")
-            desired_prefixes.append(name)
-
-    # ensure unique and available
+    # Use every predictor raster present in the package.
+    # This keeps the pipeline resilient when the package only contains a small subset of coverages.
     desired = []
-    for name in desired_prefixes:
-        key = f"raster__{name}"
-        if key in data.files:
-            desired.append((name, key))
+    for key in data.files:
+        if not key.startswith("raster__"):
+            continue
+        if key.endswith("__crs") or key.endswith("__transform"):
+            continue
+        if key == "raster":
+            continue
+        desired.append((key.replace("raster__", ""), key))
 
     if len(desired) == 0:
-        raise RuntimeError("No desired predictor rasters found in package")
+        raise RuntimeError("No predictor rasters found in package")
 
     # helper: resample source array to destination grid
     def resample_to_base(src_arr, src_transform, src_crs, dst_shape, dst_transform, dst_crs):
@@ -459,6 +457,8 @@ def prepare_training_data(data):
     X = X_full[keep_idx]
     y = labels[keep_idx]
 
+    prepare_training_data.last_feature_names = list(feature_names)
+
     return X, y
 
 
@@ -478,6 +478,9 @@ def main():
 
     clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
     clf.fit(X_train, y_train)
+    feature_names = getattr(prepare_training_data, "last_feature_names", None)
+    if feature_names:
+        clf.feature_names_in_ = np.array(feature_names, dtype=object)
 
     y_pred = clf.predict(X_test)
     y_score = clf.predict_proba(X_test)[:, 1]

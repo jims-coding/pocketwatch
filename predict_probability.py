@@ -22,6 +22,39 @@ HIGH_CONFIDENCE_THRESHOLD = 0.90
 def load_package(npz_path):
     if not os.path.exists(npz_path):
         raise FileNotFoundError(npz_path)
+
+    rasters_dir = os.path.join(OUTPUT_DIR, "rasters")
+    if os.path.isdir(rasters_dir) and any(fn.lower().endswith((".tif", ".tiff")) for fn in os.listdir(rasters_dir)):
+        mapping = {}
+        for fn in sorted(os.listdir(rasters_dir)):
+            if not fn.lower().endswith((".tif", ".tiff")):
+                continue
+            key = f"raster__{os.path.splitext(fn)[0]}"
+            path = os.path.join(rasters_dir, fn)
+            try:
+                with rasterio.open(path) as ds:
+                    arr = ds.read(1)
+                    transform = ds.transform
+                    crs = ds.crs
+                    mapping[key] = arr
+                    mapping[f"{key}__transform"] = np.array([transform.a, transform.b, transform.c, transform.d, transform.e, transform.f])
+                    mapping[f"{key}__crs"] = np.array([str(crs)])
+            except Exception:
+                continue
+
+        class _NPZLike:
+            def __init__(self, mp):
+                self._mp = mp
+                self.files = list(mp.keys())
+            def __contains__(self, k):
+                return k in self._mp
+            def __getitem__(self, k):
+                return self._mp[k]
+            def get(self, k, default=None):
+                return self._mp.get(k, default)
+
+        return _NPZLike(mapping)
+
     return np.load(npz_path, allow_pickle=True)
 
 
@@ -66,7 +99,7 @@ def build_feature_matrix(raster):
     return X, valid_mask
 
 
-def build_stacked_features_from_package(data):
+def build_stacked_features_from_package(data, feature_names=None):
     # determine base raster key
     if "raster" in data:
         base_key = "raster"
@@ -85,15 +118,19 @@ def build_stacked_features_from_package(data):
     base_transform_aff = train_model._coerce_transform(base_transform)
     base_crs_val = train_model._coerce_crs(base_crs)
 
-    # collect desired predictors in the same order used during training
-    desired_prefixes = [
-        "ml_nat_conductivity__national_0_4m_conductivity_prediction_median",
-        "ml_nat_conductivity__national_30m_conductivity_prediction_median",
-    ]
-    for k in data.files:
-        if k.startswith("raster__ml_oxides__") and k.endswith("_prediction_median"):
-            name = k.replace("raster__", "")
-            desired_prefixes.append(name)
+    # collect predictors in the exact training order when available
+    if feature_names:
+        desired_prefixes = [name for name in feature_names if f"raster__{name}" in data.files]
+    else:
+        desired_prefixes = []
+        for k in data.files:
+            if not k.startswith("raster__"):
+                continue
+            if k.endswith("__crs") or k.endswith("__transform"):
+                continue
+            if k == "raster":
+                continue
+            desired_prefixes.append(k.replace("raster__", ""))
 
     feature_arrays = []
     dst_shape = base.shape
@@ -206,7 +243,10 @@ def main():
     model = load_model(MODEL_PATH)
 
     # Build stacked feature matrix from the package (resampled to base grid)
-    X, valid_mask, base_raster, base_transform_aff, base_crs_val = build_stacked_features_from_package(data)
+    model_feature_names = getattr(model, "feature_names_in_", None)
+    if model_feature_names is not None:
+        model_feature_names = [str(name) for name in list(model_feature_names)]
+    X, valid_mask, base_raster, base_transform_aff, base_crs_val = build_stacked_features_from_package(data, feature_names=model_feature_names)
 
     if not hasattr(model, "predict_proba"):
         raise RuntimeError("Loaded model does not support predict_proba")
