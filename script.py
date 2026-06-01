@@ -37,10 +37,10 @@ class WAExplorationPipeline:
         preferred = ["mo:MinOccView", "gsml:MappedFeature", "er:MiningFeatureOccurrence"]
         for layer_name in preferred:
             if layer_name in layer_names:
-                print(f"   ✅ Selected mineral-occurrence layer: {layer_name}")
+                print(f"   Selected mineral-occurrence layer: {layer_name}")
                 return layer_name
 
-        print("   ⚠️ No explicit mineral-occurrence layer found")
+        print("   No explicit mineral-occurrence layer found")
         return None
 
     def discover_wfs_layers(self, search_term):
@@ -51,12 +51,12 @@ class WAExplorationPipeline:
             matches = [name for name in layer_names if search_term.lower() in name.lower()]
             if matches:
                 for match in matches:
-                    print(f"   ✅ Found valid server layer: {match}")
+                    print(f"   Found valid server layer: {match}")
             else:
-                print(f"   ⚠️ No layers found containing '{search_term}'")
+                print(f"   No layers found containing '{search_term}'")
             return matches
         except Exception as e:
-             print(f"❌ Discovery Error: {e}")
+             print(f"Discovery Error: {e}")
              return []
 
     def calculate_bbox(self, lat, lon, buffer_meters=100000):
@@ -87,7 +87,7 @@ class WAExplorationPipeline:
 
             raw_text = response.text.strip()
             if raw_text.startswith("<ServiceExceptionReport") or raw_text.startswith("<?xml"):
-                print(f"   ❌ Server XML Exception: {raw_text[:300]}")
+                print(f"   Server XML Exception: {raw_text[:300]}")
                 return None
 
             gdf = gpd.read_file(io.StringIO(raw_text))
@@ -100,7 +100,7 @@ class WAExplorationPipeline:
             return gdf.to_crs(epsg=self.target_epsg)
             
         except Exception as e:
-            print(f"❌ WFS Network Error: {e}")
+            print(f"WFS Network Error: {e}")
             return None
 
     def list_wcs_coverages(self):
@@ -116,7 +116,7 @@ class WAExplorationPipeline:
                 covs = set(re.findall(r'coverageId="(.*?)"', txt))
             return sorted(list(covs))
         except Exception as e:
-            print(f"❌ WCS GetCapabilities error: {e}")
+            print(f"WCS GetCapabilities error: {e}")
             return [self.raster_coverage_id]
 
 
@@ -290,7 +290,7 @@ class WAExplorationPipeline:
         except Exception:
             pass
 
-        print(f"❌ Raster Error for {coverage_id}: {last_error}")
+        print(f"Raster Error for {coverage_id}: {last_error}")
         return None
 
     def save_payload(self, payload):
@@ -349,7 +349,7 @@ class WAExplorationPipeline:
         crs = raster_info.get("crs") or f"EPSG:{self.target_epsg}"
 
         if transform is None:
-            print("   ⚠️ No geotransform available; skipping GeoTIFF save.")
+            print("   No geotransform available; skipping GeoTIFF save.")
             return None
 
         affine = Affine(*transform)
@@ -433,7 +433,7 @@ class WAExplorationPipeline:
 if __name__ == "__main__":
     pipeline = WAExplorationPipeline(target_epsg=7851)
     
-    print("\n--- 🕵️ STEP 1: DISCOVERING HIDDEN DMIRS LAYER NAMES ---")
+    print("\n--- STEP 1: DISCOVERING HIDDEN DMIRS LAYER NAMES ---")
     print("Searching for mineral-occurrence layer...")
     mineral_layer = pipeline.select_mineral_occurrence_layer()
     print("\nSearching for Fault layers...")
@@ -452,10 +452,10 @@ if __name__ == "__main__":
     #target_lat = -28.8851
     #target_lon = 121.3283
 
-    print(f"\n--- 🚀 STEP 2: RUNNING PIPELINE FOR TARGET ({target_lat}, {target_lon}) ---")
+    print(f"\n--- STEP 2: RUNNING PIPELINE FOR TARGET ({target_lat}, {target_lon}) ---")
     dataset_package = pipeline.execute_pipeline(target_lat, target_lon, v_targets)
     
-    print("\n--- 📊 EXTRACTED FEATURE MATRIX SUMMARY ---")
+    print("\n--- EXTRACTED FEATURE MATRIX SUMMARY ---")
     if v_targets and v_targets[0] in dataset_package["vector"]:
         occ_df = dataset_package["vector"][v_targets[0]]
         print(f"Mineral Occurrences   : {len(occ_df)} features detected")
@@ -479,4 +479,4 @@ if __name__ == "__main__":
         if "aster_quartz" in dataset_package["raster"]:
             pipeline.save_raster_geotiff(dataset_package["raster"]["aster_quartz"])
     except Exception as e:
-        print(f"❌ Failed to save GeoTIFF: {e}")
+        print(f"Failed to save GeoTIFF: {e}")

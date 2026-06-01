@@ -33,8 +33,13 @@ def load_raster_layer(path):
         arr = ds.read(1).astype(np.float32)
         if ds.nodata is not None:
             arr = np.where(arr == ds.nodata, np.nan, arr)
-        src_crs = ds.crs
+        src_crs = ds.crs or "EPSG:4326"
         src_transform = ds.transform
+        # compute original bounds in 4326 for external queries
+        try:
+            src_bounds_4326 = transform_bounds(src_crs, "EPSG:4326", ds.bounds.left, ds.bounds.bottom, ds.bounds.right, ds.bounds.top, densify_pts=21)
+        except Exception:
+            src_bounds_4326 = None
         if str(src_crs).upper() != "EPSG:3857":
             dst_transform, dst_w, dst_h = calculate_default_transform(src_crs, "EPSG:3857", ds.width, ds.height, *ds.bounds)
             dst = np.full((dst_h, dst_w), np.nan, np.float32)
@@ -58,6 +63,7 @@ def load_raster_layer(path):
         "y": miny,
         "dw": maxx - minx,
         "dh": maxy - miny,
+        "bounds_4326": src_bounds_4326,
     }
 
 
