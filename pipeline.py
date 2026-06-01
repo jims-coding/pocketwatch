@@ -49,14 +49,15 @@ def save_layer_manifest(logger, payload, feature_names=None):
         logger.info("Training features: %s", ", ".join(manifest["training_feature_names"]))
 
 
-def run_pipeline(lat, lon, target_epsg=7851, force=False):
+def run_pipeline(lat, lon, target_epsg=7851, force=False, pad_fraction=0.20, pad_meters=None, log_wcs=False):
     logger = setup_logging()
     logger.info("Starting unified pipeline")
     logger.info("Target location lat=%s lon=%s target_epsg=%s", lat, lon, target_epsg)
+    logger.info("WCS padding: fraction=%s meters=%s log_wcs=%s", pad_fraction, pad_meters, log_wcs)
     if force:
         logger.info("Force flag enabled: forcing retrain and full raster downloads")
 
-    pipeline = script.WAExplorationPipeline(target_epsg=target_epsg)
+    pipeline = script.WAExplorationPipeline(target_epsg=target_epsg, pad_fraction=pad_fraction, pad_meters=pad_meters, log_wcs=log_wcs)
 
     logger.info("Discovering WFS layers")
     mineral_layer = pipeline.select_mineral_occurrence_layer()
@@ -114,5 +115,8 @@ if __name__ == "__main__":
     parser.add_argument("--lon", type=float, default=121.5065, help="Target longitude for ingestion")
     parser.add_argument("--target-epsg", type=int, default=7851, help="Target EPSG for ingestion")
     parser.add_argument("--force", action="store_true", help="Force retraining and full raster downloads even if a model exists")
+    parser.add_argument("--pad-fraction", type=float, default=0.20, help="Fractional padding for WCS requests (e.g. 0.2 => 20%)")
+    parser.add_argument("--pad-meters", type=float, default=None, help="Fixed padding in metres for WCS requests (overrides pad-fraction if set)")
+    parser.add_argument("--log-wcs", action="store_true", help="Log expanded WCS request bounds for debugging")
     args = parser.parse_args()
-    run_pipeline(args.lat, args.lon, target_epsg=args.target_epsg, force=args.force)
+    run_pipeline(args.lat, args.lon, target_epsg=args.target_epsg, force=args.force, pad_fraction=args.pad_fraction, pad_meters=args.pad_meters, log_wcs=args.log_wcs)

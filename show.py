@@ -20,10 +20,16 @@ VECTOR_DIR = os.path.join(OUTPUT_DIR, "vectors")
 PROB_TIF = os.path.join(OUTPUT_DIR, "probability_grid.tif")
 TP_TIF = os.path.join(OUTPUT_DIR, "high_confidence_grid.tif")
 
+# Canonical CRS objects (avoid hardcoded string comparisons)
+from rasterio.crs import CRS
+GEO_CRS = CRS.from_string("EPSG:4326")
+DISPLAY_CRS = CRS.from_string("EPSG:3857")
+# reuse transformer for lon/lat -> web mercator
+_WEB_MERCATOR_TRANSFORMER = Transformer.from_crs(GEO_CRS, DISPLAY_CRS, always_xy=True)
+
 
 def lonlat_to_web_mercator(lon, lat):
-    tr = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    return tr.transform(lon, lat)
+    return _WEB_MERCATOR_TRANSFORMER.transform(lon, lat)
 
 
 def load_raster_layer(path):
@@ -33,33 +39,39 @@ def load_raster_layer(path):
         arr = ds.read(1).astype(np.float32)
         if ds.nodata is not None:
             arr = np.where(arr == ds.nodata, np.nan, arr)
-        src_crs = ds.crs if ds.crs is not None else rasterio.crs.CRS.from_string("EPSG:4326")
+        src_crs = ds.crs if ds.crs is not None else GEO_CRS
         src_transform = ds.transform
         # compute original bounds in 4326 for external queries
         try:
-            src_bounds_4326 = transform_bounds(src_crs, "EPSG:4326", ds.bounds.left, ds.bounds.bottom, ds.bounds.right, ds.bounds.top, densify_pts=21)
+            src_bounds_4326 = transform_bounds(src_crs, GEO_CRS, ds.bounds.left, ds.bounds.bottom, ds.bounds.right, ds.bounds.top, densify_pts=21)
         except Exception:
             src_bounds_4326 = None
-        if str(src_crs).upper() != "EPSG:3857":
-            dst_transform, dst_w, dst_h = calculate_default_transform(src_crs, "EPSG:3857", ds.width, ds.height, *ds.bounds)
+        reprojected = False
+        if src_crs != DISPLAY_CRS:
+            dst_transform, dst_w, dst_h = calculate_default_transform(src_crs, DISPLAY_CRS, ds.width, ds.height, *ds.bounds)
             dst = np.full((dst_h, dst_w), np.nan, np.float32)
-            reproject(source=arr, destination=dst, src_transform=src_transform, src_crs=src_crs, dst_transform=dst_transform, dst_crs="EPSG:3857", resampling=Resampling.bilinear, src_nodata=ds.nodata, dst_nodata=np.nan)
+            reproject(source=arr, destination=dst, src_transform=src_transform, src_crs=src_crs, dst_transform=dst_transform, dst_crs=DISPLAY_CRS, resampling=Resampling.bilinear, src_nodata=ds.nodata, dst_nodata=np.nan)
             arr3857 = dst
             transform3857 = dst_transform
+            reprojected = True
         else:
             arr3857 = arr
             transform3857 = src_transform
+
+        # If we reprojected the array, its CRS is now the display CRS
+        out_crs = DISPLAY_CRS if reprojected else src_crs
 
     if np.isfinite(arr3857).sum() == 0:
         return None
 
     minx, miny, maxx, maxy = array_bounds(arr3857.shape[0], arr3857.shape[1], transform3857)
+
     return {
         "name": os.path.splitext(os.path.basename(path))[0],
         "raw": arr3857,
         "img": np.flipud(arr3857),
         "transform": transform3857,
-        "crs": src_crs,
+        "crs": out_crs,
         "x": minx,
         "y": miny,
         "dw": maxx - minx,
@@ -84,11 +96,14 @@ def build_overlap(raster_layers):
     if not raster_layers:
         return None
     base = raster_layers[0]
+    base_crs = base.get('crs', DISPLAY_CRS)
     mask = np.isfinite(base["raw"]).astype(np.uint8)
     for lyr in raster_layers[1:]:
         src = np.where(np.isfinite(lyr["raw"]), 1, 0).astype(np.uint8)
         warped = np.zeros_like(mask)
-        reproject(source=src, destination=warped, src_transform=lyr["transform"], src_crs="EPSG:3857", dst_transform=base["transform"], dst_crs="EPSG:3857", resampling=Resampling.nearest, src_nodata=0, dst_nodata=0)
+        src_crs = lyr.get('crs', DISPLAY_CRS)
+        dst_crs = base_crs
+        reproject(source=src, destination=warped, src_transform=lyr["transform"], src_crs=src_crs, dst_transform=base["transform"], dst_crs=dst_crs, resampling=Resampling.nearest, src_nodata=0, dst_nodata=0)
         mask = mask & (warped > 0)
     if mask.sum() == 0:
         return None
@@ -115,8 +130,8 @@ def load_tp_points(path):
     rows, cols = np.where(mask)
     xs, ys = [], []
     transformer = None
-    if crs is not None and str(crs).upper() != "EPSG:4326":
-        transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
+    if crs is not None and crs != GEO_CRS:
+        transformer = Transformer.from_crs(crs, GEO_CRS, always_xy=True)
     for r, c in zip(rows, cols):
         xraw, yraw = rasterio.transform.xy(tr, r, c, offset="center")
         if transformer is not None:
@@ -182,7 +197,7 @@ def build_map(out_map=os.path.join(OUTPUT_DIR, "map.html"), tif_path=TP_TIF):
         else:
             raster_layers = []
 
-    # Align all raster layers to a common base grid (first layer) in EPSG:3857
+    # Align all raster layers to a common base grid (first layer) in DISPLAY_CRS
     if raster_layers:
         base = raster_layers[0]
         base_transform = base['transform']
@@ -195,7 +210,7 @@ def build_map(out_map=os.path.join(OUTPUT_DIR, "map.html"), tif_path=TP_TIF):
                 if lyr_transform_tuple == base_transform_tuple and lyr['raw'].shape == base_shape:
                     continue
                 dst = np.full(base_shape, np.nan, dtype=np.float32)
-                src_crs = lyr.get('crs', 'EPSG:3857')
+                src_crs = lyr.get('crs', DISPLAY_CRS)
                 src_nodata = None
                 # attempt to reuse nodata when present
                 if hasattr(lyr, 'get'):
@@ -207,7 +222,7 @@ def build_map(out_map=os.path.join(OUTPUT_DIR, "map.html"), tif_path=TP_TIF):
                     src_transform=lyr['transform'],
                     src_crs=src_crs,
                     dst_transform=base_transform,
-                    dst_crs='EPSG:3857',
+                    dst_crs=base.get('crs', DISPLAY_CRS),
                     resampling=Resampling.bilinear,
                     src_nodata=src_nodata,
                     dst_nodata=np.nan,
@@ -279,16 +294,16 @@ def load_prob_for_display(tif_path):
         if ds.nodata is not None:
             arr = np.where(arr == ds.nodata, np.nan, arr)
         crs = ds.crs
-        if str(crs).upper() != "EPSG:3857":
-            dst_transform, dst_w, dst_h = calculate_default_transform(crs, "EPSG:3857", ds.width, ds.height, *ds.bounds)
+        if crs != DISPLAY_CRS:
+            dst_transform, dst_w, dst_h = calculate_default_transform(crs, DISPLAY_CRS, ds.width, ds.height, *ds.bounds)
             dst = np.full((dst_h, dst_w), np.nan, np.float32)
-            reproject(source=arr, destination=dst, src_transform=ds.transform, src_crs=crs, dst_transform=dst_transform, dst_crs="EPSG:3857", resampling=Resampling.nearest, src_nodata=ds.nodata, dst_nodata=np.nan)
+            reproject(source=arr, destination=dst, src_transform=ds.transform, src_crs=crs, dst_transform=dst_transform, dst_crs=DISPLAY_CRS, resampling=Resampling.nearest, src_nodata=ds.nodata, dst_nodata=np.nan)
             arrm = np.flipud(dst)
             minx, miny, maxx, maxy = rasterio.transform.array_bounds(dst_h, dst_w, dst_transform)
         else:
             arrm = np.flipud(arr)
             minx, miny, maxx, maxy = rasterio.transform.array_bounds(ds.height, ds.width, ds.transform)
-        return arrm, minx, miny, maxx - minx, maxy - miny, transform_bounds(str(crs), "EPSG:4326", *ds.bounds)
+        return arrm, minx, miny, maxx - minx, maxy - miny, transform_bounds(crs, GEO_CRS, *ds.bounds)
 
 
 if __name__ == "__main__":

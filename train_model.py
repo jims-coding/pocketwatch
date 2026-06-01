@@ -7,6 +7,10 @@ from pyproj import Transformer
 import geopandas as gpd
 import rasterio
 from rasterio.warp import reproject, Resampling
+from rasterio.crs import CRS
+
+# canonical geographic CRS
+GEO_CRS = CRS.from_string("EPSG:4326")
 
 # optional local stats/distance
 try:
@@ -361,20 +365,15 @@ def prepare_training_data(data):
     # Transform occurrence coords to raster CRS if needed
     occ_coords = [(pt.x, pt.y) for pt in gdf.geometry]
 
+    # Coerce raster CRS into a CRS object
     if raster_crs is None:
-        raster_crs = "EPSG:4326"
+        raster_crs_obj = GEO_CRS
     else:
-        raster_crs = _coerce_crs(raster_crs) or "EPSG:4326"
+        s = _coerce_crs(raster_crs) or "EPSG:4326"
+        raster_crs_obj = CRS.from_string(s)
 
-    if raster_crs.upper().startswith("EPSG"):
-        src_crs = "EPSG:4326"
-        dst_crs = raster_crs
-    else:
-        src_crs = "EPSG:4326"
-        dst_crs = raster_crs
-
-    if dst_crs is None:
-        dst_crs = "EPSG:4326"
+    src_crs = GEO_CRS
+    dst_crs = raster_crs_obj
 
     if dst_crs != src_crs:
         transformer = Transformer.from_crs(src_crs, dst_crs, always_xy=True)

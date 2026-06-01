@@ -6,6 +6,10 @@ import rasterio
 from rasterio.transform import Affine
 from rasterio.warp import reproject, Resampling
 import train_model
+from rasterio.crs import CRS
+
+# canonical geographic CRS
+GEO_CRS = CRS.from_string("EPSG:4326")
 
 OUTPUT_DIR = "output"
 MODEL_PATH = os.path.join(OUTPUT_DIR, "model.joblib")
@@ -229,7 +233,7 @@ def save_probability_geotiff(prob_grid, transform, raster_crs, out_path):
         "width": int(prob_grid.shape[1]),
         "count": 1,
         "dtype": "float32",
-        "crs": raster_crs or "EPSG:4326",
+        "crs": raster_crs or GEO_CRS,
         "transform": transform,
         "nodata": np.nan,
         "compress": "LZW",
@@ -249,7 +253,7 @@ def save_binary_geotiff(mask_grid, transform, raster_crs, out_path):
         "width": int(mask_grid.shape[1]),
         "count": 1,
         "dtype": "uint8",
-        "crs": raster_crs or "EPSG:4326",
+        "crs": raster_crs or GEO_CRS,
         "transform": transform,
         "nodata": 0,
         "compress": "LZW",

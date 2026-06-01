@@ -11,14 +11,22 @@ from rasterio.warp import transform_bounds
 import rasterio
 from rasterio.io import MemoryFile
 from rasterio.transform import Affine
+from rasterio.crs import CRS
+
+# canonical geographic CRS
+GEO_CRS = CRS.from_string("EPSG:4326")
 
 class WAExplorationPipeline:
-    def __init__(self, target_epsg=7851, pad_fraction=0.20):
+    def __init__(self, target_epsg=7851, pad_fraction=0.20, pad_meters=None, log_wcs=False):
         self.target_epsg = target_epsg
         # Fractional padding applied to requested bbox when asking WCS for coverage
         # (e.g. 0.20 requests 20% extra margin on each side). This is the master
         # buffer setting used to avoid reprojection edge gaps.
         self.pad_fraction = float(pad_fraction)
+        # Optional fixed padding in metres. If set, this takes precedence over pad_fraction.
+        self.pad_meters = float(pad_meters) if pad_meters is not None else None
+        # If True, log expanded request bounds used for WCS GetCoverage requests.
+        self.log_wcs = bool(log_wcs)
         self.wfs_url = "https://geossdi.dmp.wa.gov.au/services/wfs"
         self.raster_resolution_m = 30
         self.raster_wcs_url = "https://services.ga.gov.au/gis/machine-learning-models/wcs"
@@ -26,8 +34,8 @@ class WAExplorationPipeline:
         self.output_dir = "output"
         os.makedirs(self.output_dir, exist_ok=True)
 
-        self.to_meters = Transformer.from_crs("EPSG:4326", f"EPSG:{target_epsg}", always_xy=True)
-        self.to_degrees = Transformer.from_crs(f"EPSG:{target_epsg}", "EPSG:4326", always_xy=True)
+        self.to_meters = Transformer.from_crs(GEO_CRS, CRS.from_string(f"EPSG:{target_epsg}"), always_xy=True)
+        self.to_degrees = Transformer.from_crs(CRS.from_string(f"EPSG:{target_epsg}"), GEO_CRS, always_xy=True)
 
     def _get_wfs_capability_layers(self):
         params = {"service": "WFS", "version": "1.0.0", "request": "GetCapabilities"}
@@ -171,10 +179,32 @@ class WAExplorationPipeline:
 
         # If we discovered axis labels and a coverage CRS, prepare transformed numeric bounds
         transformed_bounds = None
-        # Expand requested bbox slightly so server returns extra margin for reprojection
-        pad = float(self.pad_fraction)
+        # Expand requested bbox slightly so server returns extra margin for reprojection.
+        # Support either fractional padding (pad_fraction) or fixed metre padding (pad_meters).
         try:
             lon_min_f, lat_min_f, lon_max_f, lat_max_f = float(lon_min), float(lat_min), float(lon_max), float(lat_max)
+        except Exception:
+            lon_min_f, lat_min_f, lon_max_f, lat_max_f = lon_min, lat_min, lon_max, lat_max
+
+        if self.pad_meters is not None:
+            # Expand bbox by a fixed metre buffer by projecting to target_epsg (assumed to be metre-based),
+            # adding the buffer, then transforming back to geographic degrees.
+            try:
+                # use the pipeline's transformer to projected CRS (target_epsg)
+                tx, ty = self.to_meters.transform(lon_min_f, lat_min_f)
+                tx2, ty2 = self.to_meters.transform(lon_max_f, lat_max_f)
+                xmin_p, xmax_p = min(tx, tx2), max(tx, tx2)
+                ymin_p, ymax_p = min(ty, ty2), max(ty, ty2)
+                xmin_p -= self.pad_meters
+                xmax_p += self.pad_meters
+                ymin_p -= self.pad_meters
+                ymax_p += self.pad_meters
+                exp_lon_min, exp_lat_min = self.to_degrees.transform(xmin_p, ymin_p)
+                exp_lon_max, exp_lat_max = self.to_degrees.transform(xmax_p, ymax_p)
+            except Exception:
+                exp_lon_min, exp_lon_max, exp_lat_min, exp_lat_max = lon_min_f, lon_max_f, lat_min_f, lat_max_f
+        else:
+            pad = float(self.pad_fraction)
             lon_c = (lon_min_f + lon_max_f) / 2.0
             lat_c = (lat_min_f + lat_max_f) / 2.0
             lon_span = max(1e-9, lon_max_f - lon_min_f)
@@ -183,13 +213,11 @@ class WAExplorationPipeline:
             exp_lon_max = lon_max_f + lon_span * pad
             exp_lat_min = lat_min_f - lat_span * pad
             exp_lat_max = lat_max_f + lat_span * pad
-        except Exception:
-            exp_lon_min, exp_lon_max, exp_lat_min, exp_lat_max = lon_min, lon_max, lat_min, lat_max
 
         if axis_labels and target_crs_code is not None:
             try:
                 from pyproj import Transformer as _Transformer
-                transformer = _Transformer.from_crs("EPSG:4326", f"EPSG:{target_crs_code}", always_xy=True)
+                transformer = _Transformer.from_crs(GEO_CRS, CRS.from_string(f"EPSG:{target_crs_code}"), always_xy=True)
                 # transform the expanded geographic bbox into coverage CRS so we can request extra margin there
                 x1, y1 = transformer.transform(float(exp_lon_min), float(exp_lat_min))
                 x2, y2 = transformer.transform(float(exp_lon_max), float(exp_lat_max))
@@ -200,13 +228,21 @@ class WAExplorationPipeline:
                 # add padding in coverage CRS as well
                 x_span = max(1e-9, a_max - a_min)
                 y_span = max(1e-9, b_max - b_min)
-                a_min_p = a_min - x_span * pad
-                a_max_p = a_max + x_span * pad
-                b_min_p = b_min - y_span * pad
-                b_max_p = b_max + y_span * pad
+                a_min_p = a_min - x_span * (self.pad_fraction if self.pad_meters is None else (self.pad_meters / max(1.0, x_span)))
+                a_max_p = a_max + x_span * (self.pad_fraction if self.pad_meters is None else (self.pad_meters / max(1.0, x_span)))
+                b_min_p = b_min - y_span * (self.pad_fraction if self.pad_meters is None else (self.pad_meters / max(1.0, y_span)))
+                b_max_p = b_max + y_span * (self.pad_fraction if self.pad_meters is None else (self.pad_meters / max(1.0, y_span)))
                 transformed_bounds = (a_min_p, a_max_p, b_min_p, b_max_p)
             except Exception:
                 transformed_bounds = None
+
+        if self.log_wcs:
+            try:
+                print(f"WCS request expanded geographic bbox: {exp_lon_min},{exp_lat_min},{exp_lon_max},{exp_lat_max}")
+                if transformed_bounds is not None:
+                    print(f"WCS request expanded coverage-crs bbox: {transformed_bounds}")
+            except Exception:
+                pass
 
         # Common candidate subsets (prefer coverage axisLabels when available)
         if axis_labels and transformed_bounds:
@@ -521,7 +557,7 @@ class WAExplorationPipeline:
             affine = Affine(*t)
             minx, miny, maxx, maxy = rasterio.transform.array_bounds(h, w, affine)
             # transform to 4326
-            gb = transform_bounds(crs, "EPSG:4326", minx, miny, maxx, maxy, densify_pts=21)
+            gb = transform_bounds(crs, GEO_CRS, minx, miny, maxx, maxy, densify_pts=21)
             # check containment (allow tiny epsilon)
             eps = 1e-6
             return (gb[0] <= bbox4326[0] + eps) and (gb[1] <= bbox4326[1] + eps) and (gb[2] >= bbox4326[2] - eps) and (gb[3] >= bbox4326[3] - eps)
@@ -548,7 +584,7 @@ class WAExplorationPipeline:
             # transform AOI bbox into raster CRS
             try:
                 from pyproj import Transformer as _Transformer
-                transformer = _Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+                transformer = _Transformer.from_crs(GEO_CRS, crs, always_xy=True)
                 x_min, y_min = transformer.transform(bbox4326[0], bbox4326[1])
                 x_max, y_max = transformer.transform(bbox4326[2], bbox4326[3])
                 # ensure ordering
