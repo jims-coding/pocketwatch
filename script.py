@@ -13,8 +13,12 @@ from rasterio.io import MemoryFile
 from rasterio.transform import Affine
 
 class WAExplorationPipeline:
-    def __init__(self, target_epsg=7851):
+    def __init__(self, target_epsg=7851, pad_fraction=0.20):
         self.target_epsg = target_epsg
+        # Fractional padding applied to requested bbox when asking WCS for coverage
+        # (e.g. 0.20 requests 20% extra margin on each side). This is the master
+        # buffer setting used to avoid reprojection edge gaps.
+        self.pad_fraction = float(pad_fraction)
         self.wfs_url = "https://geossdi.dmp.wa.gov.au/services/wfs"
         self.raster_resolution_m = 30
         self.raster_wcs_url = "https://services.ga.gov.au/gis/machine-learning-models/wcs"
@@ -167,17 +171,40 @@ class WAExplorationPipeline:
 
         # If we discovered axis labels and a coverage CRS, prepare transformed numeric bounds
         transformed_bounds = None
+        # Expand requested bbox slightly so server returns extra margin for reprojection
+        pad = float(self.pad_fraction)
+        try:
+            lon_min_f, lat_min_f, lon_max_f, lat_max_f = float(lon_min), float(lat_min), float(lon_max), float(lat_max)
+            lon_c = (lon_min_f + lon_max_f) / 2.0
+            lat_c = (lat_min_f + lat_max_f) / 2.0
+            lon_span = max(1e-9, lon_max_f - lon_min_f)
+            lat_span = max(1e-9, lat_max_f - lat_min_f)
+            exp_lon_min = lon_min_f - lon_span * pad
+            exp_lon_max = lon_max_f + lon_span * pad
+            exp_lat_min = lat_min_f - lat_span * pad
+            exp_lat_max = lat_max_f + lat_span * pad
+        except Exception:
+            exp_lon_min, exp_lon_max, exp_lat_min, exp_lat_max = lon_min, lon_max, lat_min, lat_max
+
         if axis_labels and target_crs_code is not None:
             try:
                 from pyproj import Transformer as _Transformer
                 transformer = _Transformer.from_crs("EPSG:4326", f"EPSG:{target_crs_code}", always_xy=True)
-                x1, y1 = transformer.transform(float(lon_min), float(lat_min))
-                x2, y2 = transformer.transform(float(lon_max), float(lat_max))
+                # transform the expanded geographic bbox into coverage CRS so we can request extra margin there
+                x1, y1 = transformer.transform(float(exp_lon_min), float(exp_lat_min))
+                x2, y2 = transformer.transform(float(exp_lon_max), float(exp_lat_max))
                 a_min = min(x1, x2)
                 a_max = max(x1, x2)
                 b_min = min(y1, y2)
                 b_max = max(y1, y2)
-                transformed_bounds = (a_min, a_max, b_min, b_max)
+                # add padding in coverage CRS as well
+                x_span = max(1e-9, a_max - a_min)
+                y_span = max(1e-9, b_max - b_min)
+                a_min_p = a_min - x_span * pad
+                a_max_p = a_max + x_span * pad
+                b_min_p = b_min - y_span * pad
+                b_max_p = b_max + y_span * pad
+                transformed_bounds = (a_min_p, a_max_p, b_min_p, b_max_p)
             except Exception:
                 transformed_bounds = None
 
@@ -191,16 +218,16 @@ class WAExplorationPipeline:
             subs_swapped = [("subset", f"{axis_labels[1]}({b_min},{b_max})"), ("subset", f"{axis_labels[0]}({a_min},{a_max})")]
             attempts.append(base_params(subs_swapped))
 
-        # Try common Lat/Long variants using geographic coords
-        latlong = [("subset", f"Lat({lat_min},{lat_max})"), ("subset", f"Long({lon_min},{lon_max})")]
+        # Try common Lat/Long variants using expanded geographic coords (request extra margin)
+        latlong = [("subset", f"Lat({exp_lat_min},{exp_lat_max})"), ("subset", f"Long({exp_lon_min},{exp_lon_max})")]
         attempts.append(base_params(latlong))
         attempts.append(base_params(list(reversed(latlong))))
-        attempts.append(base_params([("subset", f"lat({lat_min},{lat_max})"), ("subset", f"long({lon_min},{lon_max})")]))
+        attempts.append(base_params([("subset", f"lat({exp_lat_min},{exp_lat_max})"), ("subset", f"long({exp_lon_min},{exp_lon_max})")]))
 
         # If discovered axis labels but no transformation (e.g., axisLabels 'Lat Long'), try using numeric degrees with those labels
         if axis_labels and not transformed_bounds:
             try:
-                subs_deg = [("subset", f"{axis_labels[0]}({lat_min},{lat_max})"), ("subset", f"{axis_labels[1]}({lon_min},{lon_max})")]
+                subs_deg = [("subset", f"{axis_labels[0]}({exp_lat_min},{exp_lat_max})"), ("subset", f"{axis_labels[1]}({exp_lon_min},{exp_lon_max})")]
                 attempts.append(base_params(subs_deg))
             except Exception:
                 pass

@@ -1,6 +1,7 @@
 import os
 import io
 import numpy as np
+import pandas as pd
 from rasterio.transform import Affine
 from pyproj import Transformer
 import geopandas as gpd
@@ -487,14 +488,15 @@ def main(force=False):
         f"Prepared training data (50% subsample, shallow gold): X={X.shape}, y={y.shape}, positives={y.sum()}"
     )
 
+    feature_names = getattr(prepare_training_data, "last_feature_names", None)
+    if feature_names:
+        X = pd.DataFrame(X, columns=list(feature_names))
+
     # Simple train/test split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y if y.sum()>0 else None)
 
     clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
     clf.fit(X_train, y_train)
-    feature_names = getattr(prepare_training_data, "last_feature_names", None)
-    if feature_names:
-        clf.feature_names_in_ = np.array(feature_names, dtype=object)
 
     y_pred = clf.predict(X_test)
     y_score = clf.predict_proba(X_test)[:, 1]

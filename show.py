@@ -33,7 +33,7 @@ def load_raster_layer(path):
         arr = ds.read(1).astype(np.float32)
         if ds.nodata is not None:
             arr = np.where(arr == ds.nodata, np.nan, arr)
-        src_crs = ds.crs or "EPSG:4326"
+        src_crs = ds.crs if ds.crs is not None else rasterio.crs.CRS.from_string("EPSG:4326")
         src_transform = ds.transform
         # compute original bounds in 4326 for external queries
         try:
@@ -59,6 +59,7 @@ def load_raster_layer(path):
         "raw": arr3857,
         "img": np.flipud(arr3857),
         "transform": transform3857,
+        "crs": src_crs,
         "x": minx,
         "y": miny,
         "dw": maxx - minx,
@@ -165,6 +166,14 @@ def build_map(out_map=os.path.join(OUTPUT_DIR, "map.html"), tif_path=TP_TIF):
     tp_tif = tif_path
 
     raster_layers = load_all_layers()
+    # Prefer the probability grid as the canonical base for display alignment
+    if os.path.exists(PROB_TIF):
+        prob_layer = load_raster_layer(PROB_TIF)
+        if prob_layer is not None:
+            # ensure prob_layer is first in the list for alignment
+            # remove any existing entry with the same name
+            raster_layers = [l for l in raster_layers if l.get('name') != prob_layer.get('name')]
+            raster_layers.insert(0, prob_layer)
     if not raster_layers:
         # fallback: try to reproject probability tif for display
         if os.path.exists(PROB_TIF):
@@ -172,6 +181,44 @@ def build_map(out_map=os.path.join(OUTPUT_DIR, "map.html"), tif_path=TP_TIF):
             raster_layers = [{"name": os.path.splitext(os.path.basename(PROB_TIF))[0], "raw": np.flipud(arr), "img": arr, "transform": None, "x": x, "y": y, "dw": dw, "dh": dh}]
         else:
             raster_layers = []
+
+    # Align all raster layers to a common base grid (first layer) in EPSG:3857
+    if raster_layers:
+        base = raster_layers[0]
+        base_transform = base['transform']
+        base_shape = base['raw'].shape
+        base_transform_tuple = tuple(base_transform)
+        for lyr in raster_layers[1:]:
+            try:
+                # If already aligned, skip
+                lyr_transform_tuple = tuple(lyr['transform']) if not isinstance(lyr['transform'], tuple) else lyr['transform']
+                if lyr_transform_tuple == base_transform_tuple and lyr['raw'].shape == base_shape:
+                    continue
+                dst = np.full(base_shape, np.nan, dtype=np.float32)
+                src_crs = lyr.get('crs', 'EPSG:3857')
+                src_nodata = None
+                # attempt to reuse nodata when present
+                if hasattr(lyr, 'get'):
+                    # lyr may be a dict from load_raster_layer; it doesn't include nodata, so default to None
+                    src_nodata = None
+                reproject(
+                    source=lyr['raw'],
+                    destination=dst,
+                    src_transform=lyr['transform'],
+                    src_crs=src_crs,
+                    dst_transform=base_transform,
+                    dst_crs='EPSG:3857',
+                    resampling=Resampling.bilinear,
+                    src_nodata=src_nodata,
+                    dst_nodata=np.nan,
+                )
+                lyr['raw'] = dst
+                lyr['img'] = np.flipud(dst)
+                lyr['transform'] = base_transform
+                lyr['x'] = base['x']; lyr['y'] = base['y']; lyr['dw'] = base['dw']; lyr['dh'] = base['dh']
+            except Exception:
+                # best-effort: leave layer as-is if reproject fails
+                continue
 
     overlap = build_overlap(raster_layers)
     bbox = raster_layers[0].get("bounds_4326") if raster_layers else (-180, -90, 180, 90)
