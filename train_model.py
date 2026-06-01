@@ -494,7 +494,7 @@ def main(force=False):
     # Simple train/test split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y if y.sum()>0 else None)
 
-    clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    clf = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42, n_jobs=-1)
     clf.fit(X_train, y_train)
 
     y_pred = clf.predict(X_test)
