@@ -455,11 +455,20 @@ def prepare_training_data(data):
     return X, y
 
 
-def main():
+def main(force=False):
     data = load_package()
 
     if RandomForestClassifier is None:
         raise RuntimeError("scikit-learn is not installed in the environment. Install: pip install scikit-learn")
+
+    # Ensure output dir exists and optionally skip training when a model exists
+    try:
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    except Exception:
+        pass
+    if os.path.exists(MODEL_PATH) and not force:
+        print(f"Model already exists at {MODEL_PATH}; skipping training.")
+        return
 
     X, y = prepare_training_data(data)
     print(

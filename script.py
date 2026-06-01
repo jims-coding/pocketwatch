@@ -374,7 +374,13 @@ class WAExplorationPipeline:
 
         print(f"-> Saved GeoTIFF: {out_path}")
 
-    def execute_pipeline(self, lat, lon, vector_layers):
+    def execute_pipeline(self, lat, lon, vector_layers, requested_rasters=None):
+        """Execute pipeline and optionally restrict raster downloads.
+
+        `requested_rasters` should be an iterable of raster basenames as stored
+        on disk (i.e., coverage_id with ':' replaced by '__'), matching the
+        keys produced under `output/rasters` (without the .tif extension).
+        """
         bbox_str = self.calculate_bbox(lat, lon)
         feature_payload = {"vector": {}, "raster": {}}
         
@@ -385,6 +391,18 @@ class WAExplorationPipeline:
         
         # Discover available coverages and pull each one (may be large)
         coverages = self.list_wcs_coverages()
+
+        # If a restricted list of rasters is provided, filter the coverage list
+        # to only those that match the requested raster basenames. The saved
+        # filenames use `coverage_id.replace(':','__')`, so compare against that.
+        if requested_rasters:
+            requested_set = set(requested_rasters)
+            # Always include the configured primary coverage id too
+            primary_name = self.raster_coverage_id.replace(':', '__')
+            def wanted(cov_id):
+                return (cov_id.replace(':', '__') in requested_set) or (cov_id.replace(':', '__') == primary_name)
+            coverages = [c for c in coverages if wanted(c)]
+
         for cov in coverages:
             info = self.pull_wcs_coverage(bbox_str, cov)
             if info is not None:

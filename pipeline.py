@@ -49,10 +49,12 @@ def save_layer_manifest(logger, payload, feature_names=None):
         logger.info("Training features: %s", ", ".join(manifest["training_feature_names"]))
 
 
-def run_pipeline(lat, lon, target_epsg=7851):
+def run_pipeline(lat, lon, target_epsg=7851, force=False):
     logger = setup_logging()
     logger.info("Starting unified pipeline")
     logger.info("Target location lat=%s lon=%s target_epsg=%s", lat, lon, target_epsg)
+    if force:
+        logger.info("Force flag enabled: forcing retrain and full raster downloads")
 
     pipeline = script.WAExplorationPipeline(target_epsg=target_epsg)
 
@@ -64,7 +66,24 @@ def run_pipeline(lat, lon, target_epsg=7851):
     logger.info("Fault matches: %s", ", ".join(fault_matches) or "none")
 
     vector_layers = [mineral_layer] if mineral_layer else []
-    payload = pipeline.execute_pipeline(lat, lon, vector_layers)
+    # If a trained model already exists and we're not forcing retrain, restrict
+    # downloads to only the rasters required by the model to run prediction
+    # (plus the primary raster). When `force` is True do full downloads.
+    requested_rasters = None
+    try:
+        if (not force) and os.path.exists(train_model.MODEL_PATH):
+            logger.info("Existing model detected; restricting raster downloads to prediction inputs")
+            try:
+                model = predict_probability.load_model(train_model.MODEL_PATH)
+                model_feature_names = getattr(model, "feature_names_in_", None)
+                if model_feature_names is not None:
+                    requested_rasters = [str(n) for n in list(model_feature_names)]
+            except Exception:
+                requested_rasters = None
+    except Exception:
+        requested_rasters = None
+
+    payload = pipeline.execute_pipeline(lat, lon, vector_layers, requested_rasters=requested_rasters)
     logger.info("Ingested vector count: %d", len(payload.get("vector", {})))
     logger.info("Ingested raster count: %d", len(payload.get("raster", {})))
 
@@ -72,7 +91,7 @@ def run_pipeline(lat, lon, target_epsg=7851):
     logger.info("Saved vector GeoJSONs and raster GeoTIFFs")
 
     logger.info("Training model")
-    train_model.main()
+    train_model.main(force=force)
     feature_names = getattr(train_model.prepare_training_data, "last_feature_names", [])
     if feature_names:
         logger.info("Model feature names: %s", ", ".join(feature_names))
@@ -94,5 +113,6 @@ if __name__ == "__main__":
     parser.add_argument("--lat", type=float, default=-30.7766, help="Target latitude for ingestion")
     parser.add_argument("--lon", type=float, default=121.5065, help="Target longitude for ingestion")
     parser.add_argument("--target-epsg", type=int, default=7851, help="Target EPSG for ingestion")
+    parser.add_argument("--force", action="store_true", help="Force retraining and full raster downloads even if a model exists")
     args = parser.parse_args()
-    run_pipeline(args.lat, args.lon, target_epsg=args.target_epsg)
+    run_pipeline(args.lat, args.lon, target_epsg=args.target_epsg, force=args.force)
