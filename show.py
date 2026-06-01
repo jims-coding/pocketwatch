@@ -34,6 +34,7 @@ TP_ONLY_TIF_FILE = os.path.join(OUTPUT_DIR, "high_confidence_grid.tif")
 TP_ONLY_MAP_FILE = os.path.join(OUTPUT_DIR, "map_tp_only.html")
 TP_POINTS_MAP_FILE = os.path.join(OUTPUT_DIR, "map_tp_points.html")
 DATA_PKG = os.path.join(OUTPUT_DIR, "dataset_package.npz")
+VECTOR_DIR = os.path.join(OUTPUT_DIR, "vectors")
 
 GOV_WFS_URL = "https://geossdi.dmp.wa.gov.au/services/wfs"
 
@@ -161,14 +162,9 @@ def fetch_gold_points(bbox4326):
     )
 
 
-def load_local_dataset_points(npz_path):
-    if not os.path.exists(npz_path):
+def load_local_dataset_points(vectors_dir):
+    if not os.path.isdir(vectors_dir):
         return ColumnDataSource(data={"x": [], "y": [], "name": [], "commodity": [], "id": []})
-
-    data = np.load(npz_path, allow_pickle=True)
-    vector_layers = data.get("vector_layers", np.array([], dtype=object))
-    if not hasattr(vector_layers, "tolist"):
-        vector_layers = np.array(vector_layers, dtype=object)
 
     xs = []
     ys = []
@@ -176,13 +172,12 @@ def load_local_dataset_points(npz_path):
     commodities = []
     ids = []
 
-    for lname in vector_layers.tolist():
-        key = f"vector__{lname.replace(':', '__')}"
-        if key not in data:
+    for fn in sorted(os.listdir(vectors_dir)):
+        if not fn.lower().endswith((".geojson", ".json")):
             continue
-        geojson_str = data[key].tolist() if hasattr(data[key], "tolist") else data[key]
+        path = os.path.join(vectors_dir, fn)
         try:
-            gdf = gpd.read_file(io.StringIO(geojson_str))
+            gdf = gpd.read_file(path)
         except Exception:
             continue
         if gdf.empty:
@@ -232,7 +227,7 @@ def build_map(out_map=TP_POINTS_MAP_FILE, tif_path=TP_ONLY_TIF_FILE):
     prob_arr, x, y, dw, dh, bbox4326 = load_probability_grid(tif_path)
     tp_points_source = load_tp_points(tif_path)
     gold_source = fetch_gold_points(bbox4326)
-    local_source = load_local_dataset_points(DATA_PKG)
+    local_source = load_local_dataset_points(VECTOR_DIR)
 
     output_file(out_map, title="TP-only Prospectivity Map")
 
@@ -325,7 +320,7 @@ def build_map(out_map=TP_POINTS_MAP_FILE, tif_path=TP_ONLY_TIF_FILE):
         text=f"""
         <div style="font-family: sans-serif; font-size: 13px; line-height: 1.4;">
                     <b>Reference grid:</b> high_confidence_grid.tif<br>
-                    <b>Local dataset:</b> dataset_package.npz as the green triangle layer<br>
+                                        <b>Local dataset:</b> output/vectors/*.geojson as the green triangle layer<br>
           <b>Government layer:</b> live WFS `mo:MinOccView` filtered to Au/gold within the raster bounds<br>
           <b>Map file:</b> {out_map}
         </div>

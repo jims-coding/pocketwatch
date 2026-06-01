@@ -25,7 +25,6 @@ except Exception:
 
 
 OUTPUT_DIR = "output"
-NPZ_PATH = os.path.join(OUTPUT_DIR, "dataset_package.npz")
 MODEL_PATH = os.path.join(OUTPUT_DIR, "model.joblib")
 TRAIN_FRACTION = 0.5
 MAX_SAMPLE_DEPTH_M = 1.0
@@ -147,18 +146,10 @@ def _filter_shallow_gold_rows(gdf, depth_limit_m=MAX_SAMPLE_DEPTH_M):
     return filtered, True
 
 
-def load_package(npz_path):
-    # Try to load the .npz package; if it's corrupted or missing, fall back
-    # to any GeoTIFFs saved under output/rasters/ and vector GeoJSONs under output/.
-    if os.path.exists(npz_path):
-        try:
-            data = np.load(npz_path, allow_pickle=True)
-            return data
-        except Exception:
-            pass
-
-    # Fallback: build a lightweight NPZ-like object from output/rasters
+def load_package(_unused_path=None):
+    # Build a lightweight package-like object from output/rasters and output/vectors.
     rasters_dir = os.path.join(OUTPUT_DIR, "rasters")
+    vectors_dir = os.path.join(OUTPUT_DIR, "vectors")
     mapping = {}
     if os.path.isdir(rasters_dir):
         for fn in sorted(os.listdir(rasters_dir)):
@@ -177,11 +168,13 @@ def load_package(npz_path):
                     continue
 
     # load vector geojson if present
-    for fn in sorted(os.listdir(OUTPUT_DIR)) if os.path.isdir(OUTPUT_DIR) else []:
-        if fn.lower().endswith('.geojson') or fn.lower().endswith('.json'):
+    if os.path.isdir(vectors_dir):
+        for fn in sorted(os.listdir(vectors_dir)):
+            if not (fn.lower().endswith('.geojson') or fn.lower().endswith('.json')):
+                continue
             key = f"vector__{os.path.splitext(fn)[0]}"
             try:
-                with open(os.path.join(OUTPUT_DIR, fn), 'r', encoding='utf8') as f:
+                with open(os.path.join(vectors_dir, fn), 'r', encoding='utf8') as f:
                     mapping[key] = np.array(f.read(), dtype=object)
             except Exception:
                 continue
@@ -463,7 +456,7 @@ def prepare_training_data(data):
 
 
 def main():
-    data = load_package(NPZ_PATH)
+    data = load_package()
 
     if RandomForestClassifier is None:
         raise RuntimeError("scikit-learn is not installed in the environment. Install: pip install scikit-learn")

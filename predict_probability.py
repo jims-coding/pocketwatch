@@ -7,7 +7,6 @@ from rasterio.warp import reproject, Resampling
 import train_model
 
 OUTPUT_DIR = "output"
-NPZ_PATH = os.path.join(OUTPUT_DIR, "dataset_package.npz")
 MODEL_PATH = os.path.join(OUTPUT_DIR, "model.joblib")
 PROB_TIF_PATH = os.path.join(OUTPUT_DIR, "probability_grid.tif")
 PROB_NPY_PATH = os.path.join(OUTPUT_DIR, "probability_grid.npy")
@@ -19,43 +18,37 @@ HIGH_CONFIDENCE_NPY_PATH = os.path.join(OUTPUT_DIR, "high_confidence_grid.npy")
 HIGH_CONFIDENCE_THRESHOLD = 0.90
 
 
-def load_package(npz_path):
-    if not os.path.exists(npz_path):
-        raise FileNotFoundError(npz_path)
-
+def load_package(_unused_path=None):
     rasters_dir = os.path.join(OUTPUT_DIR, "rasters")
-    if os.path.isdir(rasters_dir) and any(fn.lower().endswith((".tif", ".tiff")) for fn in os.listdir(rasters_dir)):
-        mapping = {}
-        for fn in sorted(os.listdir(rasters_dir)):
-            if not fn.lower().endswith((".tif", ".tiff")):
-                continue
-            key = f"raster__{os.path.splitext(fn)[0]}"
-            path = os.path.join(rasters_dir, fn)
-            try:
-                with rasterio.open(path) as ds:
-                    arr = ds.read(1)
-                    transform = ds.transform
-                    crs = ds.crs
-                    mapping[key] = arr
-                    mapping[f"{key}__transform"] = np.array([transform.a, transform.b, transform.c, transform.d, transform.e, transform.f])
-                    mapping[f"{key}__crs"] = np.array([str(crs)])
-            except Exception:
-                continue
+    mapping = {}
+    for fn in sorted(os.listdir(rasters_dir)) if os.path.isdir(rasters_dir) else []:
+        if not fn.lower().endswith((".tif", ".tiff")):
+            continue
+        key = f"raster__{os.path.splitext(fn)[0]}"
+        path = os.path.join(rasters_dir, fn)
+        try:
+            with rasterio.open(path) as ds:
+                arr = ds.read(1)
+                transform = ds.transform
+                crs = ds.crs
+                mapping[key] = arr
+                mapping[f"{key}__transform"] = np.array([transform.a, transform.b, transform.c, transform.d, transform.e, transform.f])
+                mapping[f"{key}__crs"] = np.array([str(crs)])
+        except Exception:
+            continue
 
-        class _NPZLike:
-            def __init__(self, mp):
-                self._mp = mp
-                self.files = list(mp.keys())
-            def __contains__(self, k):
-                return k in self._mp
-            def __getitem__(self, k):
-                return self._mp[k]
-            def get(self, k, default=None):
-                return self._mp.get(k, default)
+    class _NPZLike:
+        def __init__(self, mp):
+            self._mp = mp
+            self.files = list(mp.keys())
+        def __contains__(self, k):
+            return k in self._mp
+        def __getitem__(self, k):
+            return self._mp[k]
+        def get(self, k, default=None):
+            return self._mp.get(k, default)
 
-        return _NPZLike(mapping)
-
-    return np.load(npz_path, allow_pickle=True)
+    return _NPZLike(mapping)
 
 
 def load_model(model_path):
@@ -239,7 +232,7 @@ def save_binary_geotiff(mask_grid, transform, raster_crs, out_path):
 
 
 def main():
-    data = load_package(NPZ_PATH)
+    data = load_package()
     model = load_model(MODEL_PATH)
 
     # Build stacked feature matrix from the package (resampled to base grid)

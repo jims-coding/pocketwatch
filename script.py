@@ -105,7 +105,7 @@ class WAExplorationPipeline:
     def list_wcs_coverages(self):
         """Return a list of available coverage IDs from the GA WCS GetCapabilities."""
         try:
-            resp = requests.get(self.raster_wcs_url, params={"service": "WCS", "request": "GetCapabilities", "version": "2.0.1"}, timeout=30)
+            resp = requests.get(self.raster_wcs_url, params={"service": "WCS", "request": "GetCapabilities", "version": "2.0.1"}, timeout=90)
             resp.raise_for_status()
             txt = resp.text
             covs = set(re.findall(r'<wcs:CoverageId>(.*?)</wcs:CoverageId>', txt))
@@ -292,21 +292,22 @@ class WAExplorationPipeline:
         print(f"❌ Raster Error for {coverage_id}: {last_error}")
         return None
 
-    def save_payload(self, payload, out_path=None):
-        """Package vector GeoJSONs and raster array/metadata into a single .npz file.
+    def save_payload(self, payload):
+        """Save vector GeoJSONs and raster GeoTIFFs for downstream steps.
 
-        Vector layers are stored as GeoJSON strings under keys `vector__<layername>`
-        (colons replaced with double-underscores). Raster is stored as `raster`,
-        with `raster_transform` and `raster_crs` metadata.
+        Vector layers are written under `output/vectors/` as GeoJSON files.
+        Raster coverages are written under `output/rasters/` as GeoTIFFs.
         """
-        data = {}
         layer_names = []
+        vectors_dir = os.path.join(self.output_dir, "vectors")
         rasters_dir = os.path.join(self.output_dir, "rasters")
+        os.makedirs(vectors_dir, exist_ok=True)
         os.makedirs(rasters_dir, exist_ok=True)
 
         for lname, gdf in payload.get("vector", {}).items():
             layer_names.append(lname)
-            key = f"vector__{lname.replace(':', '__')}"
+            file_name = f"{lname.replace(':', '__')}.geojson"
+            out_path = os.path.join(vectors_dir, file_name)
             try:
                 if gdf is None or gdf.empty:
                     geojson = "{}"
@@ -314,26 +315,19 @@ class WAExplorationPipeline:
                     geojson = gdf.to_crs(epsg=4326).to_json()
             except Exception:
                 geojson = "{}"
-            data[key] = np.array(geojson, dtype=object)
+            with open(out_path, "w", encoding="utf-8") as handle:
+                handle.write(geojson)
+            print(f"-> Saved GeoJSON: {out_path}")
 
         # Save all raster coverages found in the payload; keep the configured primary coverage
         raster_dict = payload.get("raster", {})
         primary = self.raster_coverage_id
-        primary_info = raster_dict.get(primary)
-        if primary_info is not None:
-            data["raster"] = primary_info.get("array")
-            data["raster_transform"] = np.array(primary_info.get("transform"), dtype=float) if primary_info.get("transform") is not None else np.array([], dtype=float)
-            data["raster_crs"] = np.array(primary_info.get("crs"), dtype=object)
 
         # Also store each coverage explicitly under a raster__<id> key for downstream use
         for cov_id, info in raster_dict.items():
-            key = f"raster__{cov_id.replace(':', '__')}"
             try:
                 if info is None:
                     continue
-                data[key] = info.get("array")
-                data[f"{key}__transform"] = np.array(info.get("transform"), dtype=float) if info.get("transform") is not None else np.array([], dtype=float)
-                data[f"{key}__crs"] = np.array(info.get("crs"), dtype=object)
                 try:
                     tif_path = os.path.join(rasters_dir, f"{cov_id.replace(':', '__')}.tif")
                     self.save_raster_geotiff(info, out_path=tif_path)
@@ -342,16 +336,7 @@ class WAExplorationPipeline:
             except Exception:
                 continue
 
-        data["vector_layers"] = np.array(layer_names, dtype=object)
-
-        out_path = out_path or os.path.join(self.output_dir, "dataset_package.npz")
-        try:
-            np.savez_compressed(out_path, **data)
-            print(f"-> Saved package to: {out_path}")
-        except MemoryError:
-            print(f"⚠️ Skipped saving {out_path}: compressed package is too large for available memory.")
-        except Exception as e:
-            print(f"⚠️ Skipped saving {out_path}: {e}")
+        print(f"-> Saved {len(layer_names)} vector layer(s) to {vectors_dir}")
 
     def save_raster_geotiff(self, raster_info, out_path=None, compress=True):
         """Save the extracted raster (numpy array + transform + crs) as a GeoTIFF file."""
