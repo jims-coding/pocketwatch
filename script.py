@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import requests
 import re
@@ -383,6 +384,21 @@ class WAExplorationPipeline:
         """
         bbox_str = self.calculate_bbox(lat, lon)
         feature_payload = {"vector": {}, "raster": {}}
+
+        # If no requested_rasters provided, try loading src_layers.json from
+        # the current working directory. Accept either a plain list or an
+        # object with a `raster_layers` key.
+        if requested_rasters is None:
+            try:
+                if os.path.exists("src_layers.json"):
+                    with open("src_layers.json", "r", encoding="utf8") as fh:
+                        js = json.load(fh)
+                        if isinstance(js, list):
+                            requested_rasters = js
+                        elif isinstance(js, dict) and "raster_layers" in js:
+                            requested_rasters = js.get("raster_layers")
+            except Exception:
+                requested_rasters = None
         
         for v_layer in vector_layers:
             gdf = self.pull_vector_features(bbox_str, v_layer)

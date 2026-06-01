@@ -16,4 +16,4 @@ dist/
 .idea/
 
 # Output files
-output/
+output*/

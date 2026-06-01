@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import joblib
+import pandas as pd
 import rasterio
 from rasterio.transform import Affine
 from rasterio.warp import reproject, Resampling
@@ -168,9 +169,92 @@ def build_stacked_features_from_package(data, feature_names=None):
         raise RuntimeError("No predictor rasters found to build features")
 
     stacked = np.stack([a.flatten() for a in feature_arrays], axis=1)
-    valid_mask = ~np.isnan(stacked).all(axis=1)
+    # Only score pixels where every predictor raster is available.
+    valid_mask = ~np.isnan(stacked).any(axis=1)
     X = stacked[valid_mask]
     return X, valid_mask, base, base_transform_aff, base_crs_val
+
+
+def build_overlap_mask_from_package(data, feature_names=None):
+    """Return a mask of pixels where every predictor raster is present.
+
+    The mask is computed on the same base grid used for scoring so it can be
+    applied directly to the probability output.
+    """
+    if "raster" in data:
+        base_key = "raster"
+    else:
+        base_key = None
+        for k in data.files:
+            if k.startswith("raster__") and not k.endswith("__crs") and not k.endswith("__transform"):
+                base_key = k
+                break
+    if base_key is None:
+        raise RuntimeError("No raster found in dataset package")
+
+    base = data[base_key]
+    base_transform = data.get(f"{base_key}__transform", data.get("raster_transform", None))
+    base_crs = data.get(f"{base_key}__crs", data.get("raster_crs", None))
+    base_transform_aff = train_model._coerce_transform(base_transform)
+    base_crs_val = train_model._coerce_crs(base_crs)
+
+    if feature_names:
+        desired_prefixes = [name for name in feature_names if f"raster__{name}" in data.files]
+    else:
+        desired_prefixes = []
+        for k in data.files:
+            if not k.startswith("raster__"):
+                continue
+            if k.endswith("__crs") or k.endswith("__transform"):
+                continue
+            if k == "raster":
+                continue
+            desired_prefixes.append(k.replace("raster__", ""))
+
+    mask_arrays = []
+    dst_shape = base.shape
+    for name in desired_prefixes:
+        key = f"raster__{name}"
+        if key not in data.files:
+            continue
+        src = data[key]
+        src_t = data.get(f"{key}__transform", None)
+        src_c = data.get(f"{key}__crs", None)
+        src_t_aff = train_model._coerce_transform(src_t)
+        src_crs_val = train_model._coerce_crs(src_c)
+
+        dst = np.full(dst_shape, np.nan, dtype=float)
+        try:
+            reproject(
+                source=src,
+                destination=dst,
+                src_transform=Affine(*src_t_aff) if src_t_aff is not None else None,
+                src_crs=src_crs_val,
+                dst_transform=Affine(*base_transform_aff) if base_transform_aff is not None else None,
+                dst_crs=base_crs_val,
+                resampling=Resampling.bilinear,
+            )
+        except Exception:
+            try:
+                reproject(
+                    source=src,
+                    destination=dst,
+                    src_transform=Affine(*src_t_aff) if src_t_aff is not None else None,
+                    src_crs=src_crs_val,
+                    dst_transform=Affine(*base_transform_aff) if base_transform_aff is not None else None,
+                    dst_crs=base_crs_val,
+                    resampling=Resampling.nearest,
+                )
+            except Exception:
+                dst = np.full(dst_shape, np.nan, dtype=float)
+
+        mask_arrays.append(np.isfinite(dst).flatten())
+
+    if not mask_arrays:
+        raise RuntimeError("No predictor rasters found to build overlap mask")
+
+    overlap_mask = np.logical_and.reduce(mask_arrays)
+    return overlap_mask, base, base_transform_aff, base_crs_val
 
 
 def predict_probability_grid(model, raster):
@@ -240,25 +324,36 @@ def main():
     if model_feature_names is not None:
         model_feature_names = [str(name) for name in list(model_feature_names)]
     X, valid_mask, base_raster, base_transform_aff, base_crs_val = build_stacked_features_from_package(data, feature_names=model_feature_names)
+    overlap_mask, _, _, _ = build_overlap_mask_from_package(data, feature_names=model_feature_names)
 
     if not hasattr(model, "predict_proba"):
         raise RuntimeError("Loaded model does not support predict_proba")
 
-    proba = model.predict_proba(X)
+    X_input = pd.DataFrame(X, columns=model_feature_names) if model_feature_names is not None else X
+    proba = model.predict_proba(X_input)
     if proba.ndim != 2 or proba.shape[1] < 2:
         raise RuntimeError("Model predict_proba output does not contain class probabilities for class 1")
 
     positive_proba = proba[:, 1].astype(np.float32)
 
     prob_grid = np.full(base_raster.size, np.nan, dtype=np.float32)
+    # Only write probabilities where every predictor overlaps.
+    prob_grid[overlap_mask] = np.nan
     prob_grid[valid_mask] = positive_proba
     prob_grid = prob_grid.reshape(base_raster.shape)
+
+    overlap_grid = np.zeros(base_raster.size, dtype=np.uint8)
+    overlap_grid[overlap_mask] = 1
+    overlap_grid = overlap_grid.reshape(base_raster.shape)
 
     high_confidence_grid = np.zeros_like(prob_grid, dtype=np.uint8)
     high_confidence_grid[np.isfinite(prob_grid) & (prob_grid >= HIGH_CONFIDENCE_THRESHOLD)] = 1
 
     np.save(PROB_NPY_PATH, prob_grid)
     save_probability_geotiff(prob_grid, base_transform_aff and Affine(*base_transform_aff) or None, base_crs_val, PROB_TIF_PATH)
+
+    np.save(os.path.join(OUTPUT_DIR, "overlap_mask.npy"), overlap_grid)
+    save_binary_geotiff(overlap_grid, base_transform_aff and Affine(*base_transform_aff) or None, base_crs_val, os.path.join(OUTPUT_DIR, "overlap_mask.tif"))
 
     np.save(HIGH_CONFIDENCE_NPY_PATH, high_confidence_grid)
     save_binary_geotiff(high_confidence_grid, base_transform_aff and Affine(*base_transform_aff) or None, base_crs_val, HIGH_CONFIDENCE_TIF_PATH)

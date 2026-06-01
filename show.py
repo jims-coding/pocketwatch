@@ -23,57 +23,208 @@ from bokeh.palettes import Turbo256
 from bokeh.plotting import figure
 from pyproj import Transformer
 from rasterio.transform import Affine, array_bounds
+from rasterio.warp import Resampling, calculate_default_transform, reproject, transform_bounds
+
+    raster_renderers = []
+    raster_labels = []
+    for layer in raster_layers:
+        display_array = layer["array"]
+        finite = display_array[np.isfinite(display_array)]
+        if finite.size == 0:
+            continue
+        low = float(np.nanpercentile(finite, 2))
+        high = float(np.nanpercentile(finite, 98))
+        if not np.isfinite(low) or not np.isfinite(high) or low == high:
+            low = float(np.nanmin(finite))
+            high = float(np.nanmax(finite))
+        mapper = LinearColorMapper(palette=Turbo256, low=low, high=high, nan_color="#00000000")
+        renderer = p.image(
+            image=[display_array],
+            x=layer["x"],
+            y=layer["y"],
+            dw=layer["dw"],
+            dh=layer["dh"],
+            color_mapper=mapper,
+            alpha=0.55,
+            visible=False,
+        )
+        raster_renderers.append(renderer)
+        raster_labels.append(layer["name"])
+
+    overlap_renderer = None
+    if overlap_layer is not None:
+        overlap_renderer = p.image(
+            image=[overlap_layer["array"]],
+            x=overlap_layer["x"],
+            y=overlap_layer["y"],
+            dw=overlap_layer["dw"],
+            dh=overlap_layer["dh"],
+            color_mapper=LinearColorMapper(palette=["#00000000", "#00c853"], low=0.0, high=1.0, nan_color="#00000000"),
+            alpha=0.22,
+            visible=True,
+        )
+
+    tp_points_renderer = p.scatter(
+        x="x",
+        y="y",
+        source=tp_points_source,
+        marker="diamond",
+        size=8,
+        color="#d81b60",
+        line_color="#880e4f",
+        fill_alpha=0.9,
+        legend_label="High-confidence TP points",
+    )
+
+    gold_renderer = p.scatter(
+        x="x",
+        y="y",
+        source=gold_source,
+        marker="circle",
+        size=8,
+        color="#ffd700",
+        line_color="#7a5f00",
+        fill_alpha=0.95,
+        legend_label="Known gold occurrences (live WFS)",
+    )
+
+    local_renderer = p.scatter(
+        x="x",
+        y="y",
+        source=local_source,
+        marker="triangle",
+        size=7,
+        color="#00b894",
+        line_color="#00695c",
+        fill_alpha=0.80,
+        legend_label="Local dataset gold points",
+    )
+
+    hover = HoverTool(
+        renderers=[gold_renderer, local_renderer],
+        tooltips=[
+            ("Name", "@name"),
+            ("Commodity", "@commodity"),
+            ("ID", "@id"),
+        ],
+    )
+    p.add_tools(hover)
+
+    # Build default active indices: make overlap mask visible by default,
+    # keep TP points, Live gold and Local gold visible.
+    labels = raster_labels + (["Overlap mask"] if overlap_renderer is not None else []) + ["TP points", "Live gold", "Local gold"]
+    active = []
+    base = len(raster_labels)
+    if overlap_renderer is not None:
+        # overlap index is `base`
+        active.append(base)
+    # indices for TP points and the two gold layers come after the raster labels and optional overlap
+    tp_index = base + (1 if overlap_renderer is not None else 0)
+    active.extend([tp_index, tp_index + 1, tp_index + 2])
+    layer_controls = CheckboxGroup(labels=labels, active=active)
+    layer_controls.js_on_change(
+        "active",
+        CustomJS(
+            args=dict(
+                raster_renderers=raster_renderers,
+                overlap_renderer=overlap_renderer,
+                tp_points_renderer=tp_points_renderer,
+                gold_renderer=gold_renderer,
+                local_renderer=local_renderer,
+            ),
+            code="""
+                for (let i = 0; i < raster_renderers.length; i++) {
+                    raster_renderers[i].visible = cb_obj.active.includes(i);
+                }
+                let base = raster_renderers.length;
+                if (overlap_renderer !== null) {
+                    overlap_renderer.visible = cb_obj.active.includes(base);
+                    base += 1;
+                }
+                tp_points_renderer.visible = cb_obj.active.includes(base);
+                gold_renderer.visible = cb_obj.active.includes(base + 1);
+                local_renderer.visible = cb_obj.active.includes(base + 2);
+            """,
+        ),
+    )
+        "name": os.path.splitext(os.path.basename(tif_path))[0],
+        "raw_array": dst_arr,
+        "array": np.flipud(dst_arr),
+        "transform_3857": dst_transform,
+        "crs_3857": "EPSG:3857",
+        "x": minx,
+        "y": miny,
+        "dw": maxx - minx,
+        "dh": maxy - miny,
+        "bounds_4326": bounds_4326,
+    }
 
 
-OUTPUT_DIR = "output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+def load_all_raster_layers(rasters_dir):
+    layers = []
+    if not os.path.isdir(rasters_dir):
+        return layers
 
-PROB_TIF_FILE = os.path.join(OUTPUT_DIR, "probability_grid.tif")
-MAP_FILE = os.path.join(OUTPUT_DIR, "map.html")
-TP_ONLY_TIF_FILE = os.path.join(OUTPUT_DIR, "high_confidence_grid.tif")
-TP_ONLY_MAP_FILE = os.path.join(OUTPUT_DIR, "map_tp_only.html")
-TP_POINTS_MAP_FILE = os.path.join(OUTPUT_DIR, "map_tp_points.html")
-DATA_PKG = os.path.join(OUTPUT_DIR, "dataset_package.npz")
-VECTOR_DIR = os.path.join(OUTPUT_DIR, "vectors")
-
-GOV_WFS_URL = "https://geossdi.dmp.wa.gov.au/services/wfs"
-
-
-def lonlat_to_web_mercator(lon, lat):
-    transformer = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
-    return transformer.transform(lon, lat)
-
-
-def bounds_to_web_mercator(west, south, east, north):
-    x0, y0 = lonlat_to_web_mercator(west, south)
-    x1, y1 = lonlat_to_web_mercator(east, north)
-    return x0, y0, x1, y1
+    for fn in sorted(os.listdir(rasters_dir)):
+        if not fn.lower().endswith((".tif", ".tiff")):
+            continue
+        layer = None
+        try:
+            layer = load_raster_layer(os.path.join(rasters_dir, fn))
+        except Exception:
+            layer = None
+        if layer is not None:
+            layers.append(layer)
+    return layers
 
 
-def load_probability_grid(tif_path):
-    if not os.path.exists(tif_path):
-        raise FileNotFoundError(tif_path)
+def build_overlap_mask_layer(raster_layers):
+    if not raster_layers:
+        return None
 
-    with rasterio.open(tif_path) as ds:
-        arr = ds.read(1).astype(float)
-        if ds.nodata is not None:
-            arr = np.where(arr == ds.nodata, np.nan, arr)
-        transform = ds.transform
-        crs = str(ds.crs) if ds.crs is not None else "EPSG:4326"
+    template = raster_layers[0]
+    template_arr = template.get("raw_array", template["array"])
+    template_shape = template_arr.shape
+    template_transform = template["transform_3857"]
 
-    height, width = arr.shape
-    minx, miny, maxx, maxy = array_bounds(height, width, transform)
+    overlap_mask = np.isfinite(template_arr).astype(np.uint8)
+    for layer in raster_layers[1:]:
+        src = np.where(np.isfinite(layer.get("raw_array", layer["array"])), 1, 0).astype(np.uint8)
+        warped = np.zeros(template_shape, dtype=np.uint8)
+        try:
+            reproject(
+                source=src,
+                destination=warped,
+                src_transform=layer["transform_3857"],
+                src_crs=layer.get("crs_3857", "EPSG:3857"),
+                dst_transform=template_transform,
+                dst_crs="EPSG:3857",
+                resampling=Resampling.nearest,
+                src_nodata=0,
+                dst_nodata=0,
+            )
+        except Exception:
+            return None
+        overlap_mask = overlap_mask & (warped > 0)
 
-    if crs.upper() != "EPSG:4326":
-        transformer = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
-        west, south = transformer.transform(minx, miny)
-        east, north = transformer.transform(maxx, maxy)
-    else:
-        west, south, east, north = minx, miny, maxx, maxy
+    if overlap_mask.sum() == 0:
+        return None
 
-    x0, y0, x1, y1 = bounds_to_web_mercator(west, south, east, north)
-    mercator_arr = np.flipud(arr)
-    return mercator_arr, x0, y0, x1 - x0, y1 - y0, (west, south, east, north)
+    mask_arr = overlap_mask.astype(np.float32)
+    finite = mask_arr[np.isfinite(mask_arr)]
+    minx, miny, maxx, maxy = array_bounds(template_shape[0], template_shape[1], template_transform)
+    return {
+        "name": "overlap_mask",
+        "raw_array": mask_arr,
+        "array": np.flipud(mask_arr),
+        "transform_3857": template_transform,
+        "crs_3857": "EPSG:3857",
+        "x": minx,
+        "y": miny,
+        "dw": maxx - minx,
+        "dh": maxy - miny,
+        "bounds_4326": template.get("bounds_4326"),
+    }
 
 
 def load_tp_points(tif_path):
@@ -224,7 +375,24 @@ def load_local_dataset_points(vectors_dir):
 
 
 def build_map(out_map=TP_POINTS_MAP_FILE, tif_path=TP_ONLY_TIF_FILE):
-    prob_arr, x, y, dw, dh, bbox4326 = load_probability_grid(tif_path)
+    raster_layers = load_all_raster_layers(RASTER_DIR)
+    if not raster_layers:
+        prob_arr, x, y, dw, dh, bbox4326 = load_probability_grid(tif_path)
+        raster_layers = [
+            {
+                "name": os.path.splitext(os.path.basename(tif_path))[0],
+                "raw_array": np.flipud(prob_arr),
+                "array": prob_arr,
+                "x": x,
+                "y": y,
+                "dw": dw,
+                "dh": dh,
+                "bounds_4326": bbox4326,
+            }
+        ]
+
+    overlap_layer = build_overlap_mask_layer(raster_layers)
+    bbox4326 = raster_layers[0]["bounds_4326"]
     tp_points_source = load_tp_points(tif_path)
     gold_source = fetch_gold_points(bbox4326)
     local_source = load_local_dataset_points(VECTOR_DIR)
@@ -242,8 +410,44 @@ def build_map(out_map=TP_POINTS_MAP_FILE, tif_path=TP_ONLY_TIF_FILE):
     )
     p.add_tile(WMTSTileSource(url="https://tile.openstreetmap.org/{Z}/{X}/{Y}.png"))
 
-    mapper = LinearColorMapper(palette=Turbo256, low=0.0, high=1.0, nan_color="#00000000")
-    tp_image_renderer = p.image(image=[prob_arr], x=x, y=y, dw=dw, dh=dh, color_mapper=mapper, alpha=0.55)
+    raster_renderers = []
+    raster_labels = []
+    for layer in raster_layers:
+        display_array = layer["array"]
+        finite = display_array[np.isfinite(display_array)]
+        if finite.size == 0:
+            continue
+        low = float(np.nanpercentile(finite, 2))
+        high = float(np.nanpercentile(finite, 98))
+        if not np.isfinite(low) or not np.isfinite(high) or low == high:
+            low = float(np.nanmin(finite))
+            high = float(np.nanmax(finite))
+        mapper = LinearColorMapper(palette=Turbo256, low=low, high=high, nan_color="#00000000")
+            renderer = p.image(
+            image=[display_array],
+            x=layer["x"],
+            y=layer["y"],
+            dw=layer["dw"],
+            dh=layer["dh"],
+            color_mapper=mapper,
+            alpha=0.55,
+                visible=False,
+        )
+        raster_renderers.append(renderer)
+        raster_labels.append(layer["name"])
+
+    overlap_renderer = None
+    if overlap_layer is not None:
+        overlap_renderer = p.image(
+            image=[overlap_layer["array"]],
+            x=overlap_layer["x"],
+            y=overlap_layer["y"],
+            dw=overlap_layer["dw"],
+            dh=overlap_layer["dh"],
+            color_mapper=LinearColorMapper(palette=["#00000000", "#00c853"], low=0.0, high=1.0, nan_color="#00000000"),
+            alpha=0.22,
+                visible=True,
+        )
 
     tp_points_renderer = p.scatter(
         x="x",
@@ -291,42 +495,58 @@ def build_map(out_map=TP_POINTS_MAP_FILE, tif_path=TP_ONLY_TIF_FILE):
     )
     p.add_tools(hover)
 
-    color_bar = ColorBar(color_mapper=mapper, ticker=BasicTicker(desired_num_ticks=6), label_standoff=10)
-    p.add_layout(color_bar, "right")
-
-    layer_controls = CheckboxGroup(
-        labels=["TP raster", "TP points", "Live gold", "Local gold"],
-        active=[0, 1, 2, 3],
-    )
+        # Build default active indices: make overlap mask visible by default,
+        # keep TP points, Live gold and Local gold visible.
+        labels = raster_labels + ([("Overlap mask")] if overlap_renderer is not None else []) + ["TP points", "Live gold", "Local gold"]
+        active = []
+        base = len(raster_labels)
+        if overlap_renderer is not None:
+            # overlap index is `base`
+            active.append(base)
+        # indices for TP points and the two gold layers come after the raster labels and optional overlap
+        tp_index = base + (1 if overlap_renderer is not None else 0)
+        active.extend([tp_index, tp_index + 1, tp_index + 2])
+        layer_controls = CheckboxGroup(labels=labels, active=active)
     layer_controls.js_on_change(
         "active",
         CustomJS(
             args=dict(
-                tp_image_renderer=tp_image_renderer,
+                raster_renderers=raster_renderers,
+                overlap_renderer=overlap_renderer,
+                <b>Exported files:</b> output/probability_grid.tif, output/high_confidence_grid.tif, output/overlap_mask.tif<br>
                 tp_points_renderer=tp_points_renderer,
                 gold_renderer=gold_renderer,
                 local_renderer=local_renderer,
             ),
             code="""
-                tp_image_renderer.visible = cb_obj.active.includes(0);
-                tp_points_renderer.visible = cb_obj.active.includes(1);
-                gold_renderer.visible = cb_obj.active.includes(2);
-                local_renderer.visible = cb_obj.active.includes(3);
+                for (let i = 0; i < raster_renderers.length; i++) {
+                    raster_renderers[i].visible = cb_obj.active.includes(i);
+                }
+                let base = raster_renderers.length;
+                if (overlap_renderer !== null) {
+                    overlap_renderer.visible = cb_obj.active.includes(base);
+                    base += 1;
+                }
+                tp_points_renderer.visible = cb_obj.active.includes(base);
+                gold_renderer.visible = cb_obj.active.includes(base + 1);
+                local_renderer.visible = cb_obj.active.includes(base + 2);
             """,
         ),
     )
 
-    info = Div(
-        text=f"""
-        <div style="font-family: sans-serif; font-size: 13px; line-height: 1.4;">
-                    <b>Reference grid:</b> high_confidence_grid.tif<br>
+        info = Div(
+                text=f"""
+                <div style="font-family: sans-serif; font-size: 13px; line-height: 1.4;">
+                                        <b>Raster layers:</b> {len(raster_labels)} local GeoTIFFs from output/rasters<br>
+                                        <b>Overlap mask:</b> intersection of pixels where every raster layer has data<br>
+                                        <b>Exported files:</b> output/probability_grid.tif, output/high_confidence_grid.tif, output/overlap_mask.tif<br>
                                         <b>Local dataset:</b> output/vectors/*.geojson as the green triangle layer<br>
-          <b>Government layer:</b> live WFS `mo:MinOccView` filtered to Au/gold within the raster bounds<br>
-          <b>Map file:</b> {out_map}
-        </div>
-        """,
-        width=1200,
-    )
+                    <b>Government layer:</b> live WFS `mo:MinOccView` filtered to Au/gold within the raster bounds<br>
+                    <b>Map file:</b> {out_map}
+                </div>
+                """,
+                width=1200,
+        )
 
     layout = column(info, layer_controls, p)
     save(layout)

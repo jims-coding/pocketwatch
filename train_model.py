@@ -314,8 +314,8 @@ def prepare_training_data(data):
 
     # stack features into (n_pixels, n_features)
     stacked = np.stack([a.flatten() for a in feature_arrays], axis=1) if len(feature_arrays) > 0 else np.zeros((raster.size, 0))
-    # mask valid by base raster
-    valid_mask = ~np.isnan(stacked).all(axis=1) & (~np.isnan(values))
+    # Keep only pixels where every predictor is available and the base raster is valid.
+    valid_mask = (~np.isnan(stacked).any(axis=1)) & (~np.isnan(values))
     if valid_mask.sum() == 0:
         raise RuntimeError("No valid pixels after stacking features")
 
